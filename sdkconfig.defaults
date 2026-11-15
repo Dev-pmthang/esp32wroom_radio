@@ -1,0 +1,28 @@
+# =============================================================================
+# sdkconfig.defaults - ESP-IDF v5.3+ Configuration for ESP32 WiFi Web Radio
+# MCU: ESP32-WROOM-32 (No PSRAM, 240 MHz Dual-Core)
+# =============================================================================
+
+# 1. Compiler Optimization (-O2 for realtime MP3/AAC decoding & Fixed-Point UI)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE=y
+
+# 2. CPU & FreeRTOS Tick Rate (240 MHz, 1000 Hz tick for 1ms resolution)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+
+# 3. Disable PSRAM (ESP32-WROOM-32 has 520 KB internal SRAM only)
+CONFIG_SPIRAM=n
+
+# 4. WiFi & Network Stream Tuning (Disable WiFi Power Save to prevent audio noise)
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+
+# 5. HTTP Client & Embedded Web Server
+CONFIG_ESP_HTTP_client_ENABLE_HTTPS=n
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512

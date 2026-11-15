@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "button_handler.c"
+        "audio_stream.c"
+        "ui_st7789.c"
+        "wifi_web.c"
+    INCLUDE_DIRS
+        "."
+        "../include"
+    REQUIRES
+        driver
+        esp_lcd
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_http_client
+        esp_http_server
+        esp_timer
+        nvs_flash
+)
