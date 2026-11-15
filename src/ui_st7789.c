@@ -185,9 +185,11 @@ static const uint8_t kFont5x7[95][5] = {
 
 /* =========================================================================
  * Bo dem DMA tinh cho Dirty-Rectangle Rendering (Zero Runtime Malloc)
+ * Dung chung 1 bo dem DMA 19.2 KB cho tat ca cac vung Dirty-Rectangle
+ * (tiet kiem 10 KB SRAM noi cho lwIP TCP sockets & Web Server)
  * ========================================================================= */
 static DMA_ATTR uint16_t s_bar_buf[TFT_WIDTH * BOTTOM_BAR_H];         /* 240x40 = 19,200 B */
-static DMA_ATTR uint16_t s_vinyl_strip_buf[VINYL_W * VINYL_STRIP_H];  /* 148x33 =  9,768 B */
+#define s_vinyl_strip_buf s_bar_buf                                   /* 148x33 =  9,768 B */
 
 static esp_lcd_panel_io_handle_t s_io_handle    = NULL;
 static esp_lcd_panel_handle_t    s_panel_handle = NULL;

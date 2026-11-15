@@ -33,6 +33,7 @@ static httpd_handle_t     s_http_server    = NULL;
 static const char kWebIndexHtml[] =
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<link rel='icon' href='data:,'>"
     "<title>ESP32 Vinyl Player</title>"
     "<style>"
     "body{background:#f4f1ea;color:#1c1c1c;font-family:sans-serif;text-align:center;padding:18px;}"
@@ -103,8 +104,16 @@ static void url_decode_inplace(char *str)
  * ========================================================================= */
 static esp_err_t http_get_root_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, kWebIndexHtml, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t http_get_favicon_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static esp_err_t http_get_status_handler(httpd_req_t *req)
@@ -130,6 +139,7 @@ static esp_err_t http_get_status_handler(httpd_req_t *req)
     );
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, json_buf, len);
 }
 
@@ -137,6 +147,7 @@ static esp_err_t http_post_toggle_handler(httpd_req_t *req)
 {
     button_toggle_play_pause();
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
@@ -144,6 +155,7 @@ static esp_err_t http_post_next_handler(httpd_req_t *req)
 {
     radio_state_cycle_station(1);
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
@@ -151,6 +163,7 @@ static esp_err_t http_post_prev_handler(httpd_req_t *req)
 {
     radio_state_cycle_station(-1);
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
@@ -167,6 +180,7 @@ static esp_err_t http_post_volume_handler(httpd_req_t *req)
         }
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
@@ -199,6 +213,7 @@ static esp_err_t http_post_wifi_handler(httpd_req_t *req)
         }
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
@@ -208,22 +223,28 @@ static void start_web_server(void)
         return;
     }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.core_id          = CORE_NETWORK_CTRL;
-    config.task_priority    = TASK_PRIO_WIFI_WEB;
-    config.stack_size       = 4096;
-    config.lru_purge_enable = true;
-    config.max_uri_handlers = 8;
+    config.core_id           = CORE_NETWORK_CTRL;
+    config.task_priority     = TASK_PRIO_WIFI_WEB;
+    config.stack_size        = 4096;
+    config.max_open_sockets  = 4;
+    config.backlog_conn      = 4;
+    config.lru_purge_enable  = true;
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 3;
+    config.max_uri_handlers  = 8;
 
     if (httpd_start(&s_http_server, &config) == ESP_OK) {
-        static const httpd_uri_t u_root   = { .uri = "/",           .method = HTTP_GET,  .handler = http_get_root_handler };
-        static const httpd_uri_t u_status = { .uri = "/api/status", .method = HTTP_GET,  .handler = http_get_status_handler };
-        static const httpd_uri_t u_toggle = { .uri = "/api/toggle", .method = HTTP_POST, .handler = http_post_toggle_handler };
-        static const httpd_uri_t u_next   = { .uri = "/api/next",   .method = HTTP_POST, .handler = http_post_next_handler };
-        static const httpd_uri_t u_prev   = { .uri = "/api/prev",   .method = HTTP_POST, .handler = http_post_prev_handler };
-        static const httpd_uri_t u_vol    = { .uri = "/api/volume", .method = HTTP_POST, .handler = http_post_volume_handler };
-        static const httpd_uri_t u_wifi   = { .uri = "/api/wifi",   .method = HTTP_POST, .handler = http_post_wifi_handler };
+        static const httpd_uri_t u_root    = { .uri = "/",            .method = HTTP_GET,  .handler = http_get_root_handler };
+        static const httpd_uri_t u_favicon = { .uri = "/favicon.ico", .method = HTTP_GET,  .handler = http_get_favicon_handler };
+        static const httpd_uri_t u_status  = { .uri = "/api/status",  .method = HTTP_GET,  .handler = http_get_status_handler };
+        static const httpd_uri_t u_toggle  = { .uri = "/api/toggle",  .method = HTTP_POST, .handler = http_post_toggle_handler };
+        static const httpd_uri_t u_next    = { .uri = "/api/next",    .method = HTTP_POST, .handler = http_post_next_handler };
+        static const httpd_uri_t u_prev    = { .uri = "/api/prev",    .method = HTTP_POST, .handler = http_post_prev_handler };
+        static const httpd_uri_t u_vol     = { .uri = "/api/volume",  .method = HTTP_POST, .handler = http_post_volume_handler };
+        static const httpd_uri_t u_wifi    = { .uri = "/api/wifi",    .method = HTTP_POST, .handler = http_post_wifi_handler };
 
         httpd_register_uri_handler(s_http_server, &u_root);
+        httpd_register_uri_handler(s_http_server, &u_favicon);
         httpd_register_uri_handler(s_http_server, &u_status);
         httpd_register_uri_handler(s_http_server, &u_toggle);
         httpd_register_uri_handler(s_http_server, &u_next);

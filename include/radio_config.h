@@ -55,8 +55,8 @@ extern "C" {
 
 /* Do uu tien cac Task (Task Priorities) */
 #define TASK_PRIO_UI_RENDER     4
-#define TASK_PRIO_WIFI_WEB      5
-#define TASK_PRIO_HTTP_STREAM   6
+#define TASK_PRIO_HTTP_STREAM   5
+#define TASK_PRIO_WIFI_WEB      7               /* Uu tien phuc vu Web Server tren Core 0 */
 #define TASK_PRIO_BTN_CTRL      10
 #define TASK_PRIO_AUDIO_I2S     16              /* Cao nhat: dam bao I2S DMA khong underrun */
 
@@ -67,10 +67,10 @@ extern "C" {
 #define STACK_SIZE_BTN_CTRL     3072
 #define STACK_SIZE_AUDIO_I2S    6144
 
-/* Cau hinh StreamBuffer (48 KB) & Pre-buffer (50% = 24 KB) */
-#define STREAM_BUF_SIZE_BYTES       (48 * 1024)
-#define STREAM_BUF_TRIGGER_BYTES    1024
-#define STREAM_PREBUFFER_BYTES      (STREAM_BUF_SIZE_BYTES / 2)
+/* Cau hinh StreamBuffer (16 KB) & Pre-buffer (4 KB) - toi uu RAM cho lwIP & Web Server */
+#define STREAM_BUF_SIZE_BYTES       (16 * 1024)
+#define STREAM_BUF_TRIGGER_BYTES    512
+#define STREAM_PREBUFFER_BYTES      (4 * 1024)
 
 /* Cau hinh I2S DMA chuan driver/i2s_std.h */
 #define I2S_DMA_DESC_NUM            8
