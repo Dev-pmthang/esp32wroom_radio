@@ -1,0 +1,322 @@
+================================================================================
+AI MASTER PROMPT & ARCHITECTURAL BLUEPRINT
+DỰ ÁN: HỆ THỐNG STREAMING AUDIO & ĐỒ HỌA THỜI GIAN THỰC TRÊN VI ĐIỀU KHIỂN
+(Bản gốc tham chiếu: ESP32-WROOM-32 Pure ESP-IDF v5.3+ / FreeRTOS Web Radio)
+================================================================================
+
+[HƯỚNG DẪN SỬ DỤNG CHO AI TIẾP NHẬN]
+Bạn là một Kỹ sư Hệ thống Nhúng C/C++ (Embedded Systems Architect) chuyên sâu về
+FreeRTOS, xử lý tín hiệu số (DSP/Audio I2S) và đồ họa vi điều khiển (SPI/DMA).
+Tài liệu này mô tả toàn bộ kiến trúc phần mềm, cấu trúc dữ liệu, các giải thuật
+tối ưu hóa bộ nhớ/CPU/mạng và quy tắc thiết kế đã được kiểm chứng thực tế trên
+phần cứng không có PSRAM (ESP32-WROOM-32, 320KB SRAM).
+
+Khi người dùng yêu cầu bạn phát triển tính năng mới, hoặc chuyển đổi (porting)
+dự án này sang một dòng chip khác (ESP32-S3, ESP32-C3/C6, STM32, RP2040/RP2350...)
+hoặc thay đổi module ngoại vi (màn hình khác, DAC âm thanh khác, nguồn phát khác),
+bạn PHẢI kế thừa nghiêm ngặt 7 trụ cột kiến trúc và giải thuật tối ưu dưới đây.
+
+================================================================================
+PHẦN 1: TỔNG QUAN DỰ ÁN & CẤU HÌNH PHẦN CỨNG THAM CHIẾU
+================================================================================
+
+1. Mục tiêu hệ thống:
+   - Phát nhạc trực tuyến (HTTP Audio Stream / ICY Metadata / Synth / Decoder)
+     qua giao tiếp I2S DMA thời gian thực không bị vấp (zero-stutter).
+   - Hiển thị giao diện "Vinyl Player - Now Playing" phong cách Retro Analog
+     trên màn hình màu TFT ở tốc độ ~25-30 FPS mượt mà mà không cần bộ đệm
+     khung hình toàn màn hình (No Full-Frame Buffer).
+   - Phản hồi tức thì (Zero-Latency) với nút nhấn vật lý (Play/Pause/Resume)
+     và cung cấp Web UI điều khiển từ xa qua WiFi STA/AP.
+
+2. Sơ đồ chân (Pinout tham chiếu trên ESP32-WROOM-32):
+   - Màn hình TFT 1.54" ST7789 (240x240, SPI2_HOST @ 27MHz DMA, IPS INVON):
+     + SCL (SCLK) = GPIO 18
+     + SDA (MOSI) = GPIO 23
+     + RES (RST)  = GPIO 4
+     + DC         = GPIO 2
+     + BLK        = GPIO 32 (High = Bật đèn nền)
+     + CS         = GPIO 5 (hoặc nối GND với module không có chân CS; kéo thấp GPIO 15)
+   - Bộ khuếch đại âm thanh số I2S MAX98357A (Standard Philips I2S 16-bit Stereo):
+     + DIN  = GPIO 25
+     + BCLK = GPIO 26
+     + LRC  = GPIO 27
+     + SD   = GPIO 33 (Chân Shutdown/Mute phần cứng: 0 = Mute tức thì, 1 = Unmute)
+   - Nút nhấn vật lý (Play / Pause / Resume):
+     + BOOT = GPIO 0 (Pull-up nội, ngắt sườn xuống GPIO_INTR_NEGEDGE)
+
+3. Cấu trúc thư mục & phân tách Module (Chuẩn C thuần ESP-IDF):
+   - include/radio_config.h : Định nghĩa Pinout, hằng số hệ thống, cấu trúc
+                              trạng thái tĩnh `radio_system_state_t` và API.
+   - src/main.c             : Khởi tạo NVS, phần cứng, bảng lượng giác tĩnh
+                              (`sin_lut`/`cos_lut`) và cấp phát các Task FreeRTOS.
+   - src/button_handler.c   : ISR GPIO 0 (`IRAM_ATTR`) + FSM lọc dội phím 2 chiều
+                              (nhấn & nhả) + điều khiển Mute phần cứng tức thì.
+   - src/audio_stream.c     : Luồng tải HTTP ICY Stream, phân tách `StreamTitle`,
+                              quản lý `StreamBuffer` và luồng giải mã/xuất I2S DMA.
+   - src/ui_st7789.c        : Engine đồ họa Scanline Dirty-Rectangle qua SPI DMA,
+                              vẽ đĩa than xoay, kim đọc (tonearm), chữ chạy (marquee),
+                              hiển thị địa chỉ IP góc trái trên cùng.
+   - src/wifi_web.c         : Quản lý WiFi STA/AP (lưu NVS), máy chủ `esp_http_server`
+                              tối ưu socket và giao diện Web SPA điều khiển.
+
+================================================================================
+PHẦN 2: KIẾN TRÚC ĐA LUỒNG FREERTOS & ĐỒNG BỘ ZERO-BLOCKING
+================================================================================
+
+Hệ thống tuyệt đối KHÔNG dùng vòng lặp bận (busy-wait) hay polling bằng delay.
+Mọi luồng giao tiếp qua `EventGroupHandle_t`, `StreamBufferHandle_t`, `Mutex`
+và `TaskNotify`:
+
+1. Phân chia Core (Đối với MCU Dual-Core như ESP32 / ESP32-S3 / RP2040):
+   - CORE 0 (Protocol, Network & Control):
+     + `wifi_and_web_task` (Priority 7, Stack 4096):
+       Khởi tạo WiFi STA/AP, tắt hoàn toàn WiFi Power Save (`WIFI_PS_NONE`) để
+       tránh sụt áp nguồn gây nhiễu lách tách trên đường I2S và giữ độ trễ mạng
+       thấp nhất. Chạy HTTP Server phục vụ Web UI.
+       LƯU Ý QUAN TRỌNG: Priority của Web/Control (7) PHẢI cao hơn Priority của
+       luồng đọc HTTP Stream (5) trên cùng Core 0 để khi người dùng truy cập
+       Web UI, luồng tải nhạc không làm nghẽn (starve) các gói tin TCP handshake.
+     + `http_stream_task` (Priority 5, Stack 4096):
+       Đọc luồng HTTP audio theo từng chunk 1024 bytes, bóc tách ICY Metadata
+       (`icy-metaint`) ngay trên đường truyền (in-stream) mà không cần buffer phụ,
+       đẩy dữ liệu âm thanh vào `StreamBuffer`. Khi ở trạng thái PAUSE, luồng này
+       ngủ hoàn toàn bằng `xEventGroupWaitBits(..., BIT_PLAY_STATE, ..., portMAX_DELAY)`
+       tiêu thụ 0% CPU và 0 băng thông mạng.
+
+   - CORE 1 (Hard Realtime Audio & Graphics UI):
+     + `audio_i2s_task` (Priority 16 - Cao nhất, Stack 6144):
+       Đọc dữ liệu từ `StreamBuffer` (sau khi đạt ngưỡng Pre-buffer), giải mã/tổng
+       hợp PCM 16-bit Stereo, nhân hệ số âm lượng số nguyên và đẩy xuống I2S DMA
+       (`i2s_channel_write`).
+     + `ui_render_task` (Priority 4, Stack 4096):
+       Cập nhật màn hình TFT theo cơ chế Dirty-Rectangle:
+       - Khi `is_playing == true`: Chu kỳ 33ms (~30 FPS), xoay đĩa than +4 độ/frame.
+       - Khi `is_playing == false`: Tự động hạ nhịp xuống chu kỳ 200ms (5 FPS) và
+         có thể đánh thức tức thì bằng `xEventGroupWaitBits` khi có cờ
+         `BIT_UI_ICON_DIRTY` hoặc `BIT_UI_TITLE_DIRTY`.
+
+   *(Ghi chú khi port sang MCU Single-Core như ESP32-C3/C6, STM32F4: Giữ nguyên
+   thứ tự ưu tiên `audio_i2s_task (16) > button_isr_task (15) > wifi_web (7) >
+   http_stream (5) > ui_render (4)`).*
+
+2. Các cờ đồng bộ `EventGroup` (`sync_events`):
+   - `BIT_WIFI_CONNECTED` : Đã có IP WiFi STA.
+   - `BIT_PLAY_STATE`     : Trạng thái hệ thống đang Play (`1`) hay Pause (`0`).
+   - `BIT_STREAM_READY`   : `StreamBuffer` đã nạp đủ ngưỡng Pre-buffer, cho phép
+                            I2S unmute và xuất âm thanh.
+   - `BIT_UI_TITLE_DIRTY` : Tên bài hát/đài hoặc IP vừa thay đổi, yêu cầu vẽ lại.
+   - `BIT_UI_ICON_DIRTY`  : Trạng thái Play/Pause hoặc góc kim đĩa than thay đổi.
+
+================================================================================
+PHẦN 3: 7 GIẢI THUẬT TỐI ƯU HÓA CỐT LÕI (BẮT BUỘC KẾ THỪA)
+================================================================================
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 1: QUẢN LÝ BỘ NHỚ TĨNH TUYỆT ĐỐI (ZERO RUNTIME HEAP FRAGMENTATION)
+--------------------------------------------------------------------------------
+- Vấn đề: Các thiết bị streaming chạy liên tục hàng ngày sẽ bị treo (crash) nếu
+  dùng `malloc`/`free`/`String`/JSON động trong vòng lặp do phân mảnh Heap.
+- Giải pháp:
+  1. Toàn bộ trạng thái hệ thống được gom vào một struct duy nhất cấp phát tĩnh
+     trong vùng `.bss` (`extern radio_system_state_t g_radio;`):
+     - Chuỗi ký tự cố định: `char station_name[32]`, `char song_title[128]`,
+       `char stream_url[160]`, `char wifi_ip[20]`.
+     - Các cờ trạng thái đọc/ghi tần suất cao dùng kiểu nguyên tử `<stdatomic.h>`:
+       `atomic_bool is_playing`, `atomic_bool is_buffering`, `atomic_bool wifi_connected`.
+     - Các biến số nguyên tối giản kích thước: `uint8_t volume` (0..100),
+       `uint8_t station_idx`, `uint16_t disc_angle` (0..359).
+     - Bảo vệ truy cập chuỗi bằng một `SemaphoreHandle_t state_mutex` duy nhất
+       với thời gian giữ khóa < 50 micro-giây (chỉ copy chuỗi rồi nhả khóa ngay).
+  2. Tuyệt đối KHÔNG gọi `malloc`/`calloc` bên trong vòng lặp của bất kỳ Task nào.
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 2: TOÁN HỌC DẤU PHẨY TĨNH (FIXED-POINT Q10) & BẢNG TRA LƯỢNG GIÁC FLASH
+--------------------------------------------------------------------------------
+- Vấn đề: Vẽ đĩa than xoay, nhãn đĩa, chữ trên đĩa và kim đọc ở tốc độ 30 FPS
+  đòi hỏi hàng chục nghìn phép tính lượng giác mỗi giây. Sử dụng `float`/`sinf()`/
+  `cosf()` làm tốn chu kỳ FPU và gây xung đột ngữ cảnh FPU giữa các Task FreeRTOS.
+- Giải pháp:
+  1. Đặt bảng tra cứu `const int16_t sin_lut[360]` và `cos_lut[360]` trong Flash
+     (`rodata`), lưu giá trị `round(sin(deg * PI / 180) * 1024)`.
+  2. Mọi phép quay tọa độ 2D `(dx, dy)` quanh tâm đĩa `(CX, CY)` đều dùng phép
+     nhân số nguyên và dịch bit `>> 10` (tương đương chia 1024):
+     ```c
+     int32_t rx = (dx * cos_val + dy * sin_val) >> 10;
+     int32_t ry = (-dx * sin_val + dy * cos_val) >> 10;
+     ```
+  3. Kiểm tra điểm nằm trong hình tròn / vành khăn (rãnh đĩa than) hoàn toàn bằng
+     bình phương bán kính (`dist_sq = dx*dx + dy*dy`), loại bỏ 100% hàm `sqrt()`.
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 3: RENDER ĐỒ HỌA SCANLINE DIRTY-RECTANGLE & TÁI SỬ DỤNG BUFFER DMA
+--------------------------------------------------------------------------------
+- Vấn đề: Màn hình 240x240 RGB565 cần `240 * 240 * 2 = 115,200 bytes` cho một
+  Full-Frame Buffer — quá lớn đối với MCU chỉ có 320KB RAM vừa chạy WiFi vừa
+  chạy Audio. Ngược lại, nếu vẽ từng pixel qua SPI thì màn hình bị nháy (tearing)
+  và cực chậm.
+- Giải pháp:
+  1. Chỉ cấp phát **1 buffer DMA dùng chung duy nhất** trong `MALLOC_CAP_DMA`:
+     `s_bar_buf` kích thước `240 * 40 * 2 = 19,200 bytes` (chiếm chưa tới 19KB RAM!).
+  2. **Chia màn hình thành các vùng Dirty-Rectangle độc lập:**
+     - `Y: 0..15`   (240x16): Thanh hiển thị địa chỉ IP góc trái trên cùng (chỉ vẽ
+                              lại đúng 1 lần khi nhận IP hoặc khi đổi IP).
+     - `Y: 16..151` (148x136): Vùng đĩa than & kim đọc (chỉ vẽ lại khi `is_playing`
+                              hoặc khi kim đọc chuyển trạng thái Play/Pause).
+     - `Y: 162..193` (240x32): Dải tên bài hát Marquee & tên đài (chỉ vẽ lại khi
+                              chữ dịch chuyển hoặc có `BIT_UI_TITLE_DIRTY`).
+     - `Y: 196..209` (240x14): Thanh tiến trình & âm lượng.
+     - `Y: 204..239` (240x36): Cụm nút điều khiển (Shuffle, Prev, Play/Pause, Next, Repeat).
+  3. **Render Đĩa Than theo Dải Quét Ngang (4 Horizontal Scanline Strips):**
+     Chia vùng đĩa than `148x136` thành 4 dải ngang, mỗi dải `148x34` (`10,064 bytes`,
+     nằm gọn trong `s_bar_buf` 19,200 bytes). Tính toán toàn bộ pixel của dải trong
+     RAM (nền kem, bóng đổ elip, đĩa đen, rãnh đồng tâm, hiệu ứng ánh sáng chéo
+     anisotropic sheen, nhãn đỏ cam cùng chữ "SLOW RIVER" xoay theo góc đĩa, và
+     kim đọc vàng đồng phủ lên trên) rồi đẩy nguyên khối qua SPI DMA.
+     -> Kết quả: Không bao giờ bị nháy hình (Zero-Flicker), không tốn 115KB RAM.
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 4: ĐỒNG BỘ SPI DMA BẰNG SEMAPHORE & XỬ LÝ POLARITY MÀN HÌNH IPS
+--------------------------------------------------------------------------------
+- Vấn đề:
+  1. Hàm `esp_lcd_panel_draw_bitmap()` là bất đồng bộ (async DMA). Nếu CPU ghi
+     đè dữ liệu dải tiếp theo vào `s_bar_buf` khi DMA chưa truyền xong dải trước,
+     hình ảnh sẽ bị rác hoặc sọc ngang.
+  2. Trên màn hình IPS ST7789, nếu thiếu lệnh đảo màu phần cứng (`0x21 INVON`)
+     hoặc sai thứ tự byte Endianness trên đường truyền SPI 8-bit, màu đen (`0x0000`)
+     sẽ biến thành màu trắng (`0xFFFF`).
+- Giải pháp:
+  1. Đăng ký callback `on_color_trans_done` của `esp_lcd_panel_io` để nhả
+     `s_lcd_dma_sem` (`xSemaphoreGiveFromISR`). Trước mỗi lần vẽ vào `s_bar_buf`,
+     hàm `lcd_draw_bitmap_dma_sync()` đợi `s_lcd_dma_sem` -> đảm bảo an toàn tuyệt
+     đối khi dùng chung 1 buffer DMA duy nhất.
+  2. Dùng macro `RGB565_SWAP(r, g, b)` hoán đổi byte cao/thấp ngay tại thời điểm
+     biên dịch (compile-time constant) để tương thích trực tiếp với SPI DMA.
+  3. Gửi tường minh lệnh `0x21` (`INVON`) sau `esp_lcd_panel_init()` cho tấm nền IPS.
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 5: MUTE PHẦN CỨNG TỨC THÌ (POP-FREE PAUSE) & LỌC DỘI PHÍM 2 CHIỀU
+--------------------------------------------------------------------------------
+- Vấn đề:
+  1. Khi nhấn Pause, nếu chỉ dừng luồng đọc mạng hoặc dừng ghi I2S, bộ đệm DMA
+     vẫn còn các mẫu âm thanh cũ lặp lại gây tiếng "bụp" hoặc "rè" khó chịu.
+  2. Nút nhấn cơ khí (như nút BOOT GPIO 0) tạo xung nhiễu ở cả sườn nhấn xuống
+     LẪN sườn nhả tay ra (khi nhả tay, tiếp điểm nảy làm xuất hiện thêm sườn xuống
+     giả), khiến thiết bị vừa chuyển sang PLAY đã lập tức bị kích ngược về PAUSE.
+- Giải pháp:
+  1. **Hardware Mute trước, Software Pause sau:**
+     Ngay khi nhận tín hiệu Pause, lập tức kéo chân `GPIO 33 (SD) = 0` ở mức
+     phần cứng (ngắt khuếch đại MAX98357A trong < 1 micro-giây), đồng thời gọi
+     `i2s_channel_preload_data` / ghi 1 khung zero-buffer và `xStreamBufferReset()`.
+     Khi chuyển sang Play, nạp đủ Pre-buffer (`BIT_STREAM_READY`) rồi mới mở
+     `GPIO 33 (SD) = 1`.
+  2. **Lọc dội phím 2 giai đoạn (ISR + Task Verification):**
+     - Giai đoạn 1 (Trong `IRAM_ATTR` ISR): Lọc thời gian 250ms bằng `esp_timer_get_time()`
+       và đánh thức `button_ctrl_task` qua `xTaskNotifyFromISR()`.
+     - Giai đoạn 2 (Trong `button_ctrl_task`):
+       + Đợi 25ms và kiểm tra `gpio_get_level(GPIO_NUM_0) == 0` để xác nhận đây là
+         cú nhấn thật chứ không phải gai nhiễu khi nhả phím.
+       + Thực thi đổi trạng thái `PLAY <-> PAUSE` ngay lập tức.
+       + Sau khi thực thi, chờ người dùng nhả nút hoàn toàn (yên tĩnh ở mức HIGH
+         liên tục 40ms) rồi xóa mọi thông báo dội còn sót bằng `ulTaskNotifyTake(pdTRUE, 0)`.
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 6: QUẢN TRỊ NGÂN SÁCH RAM NỘI & CHỐNG LỖI LWIP SOCKET (ERRNO 113)
+--------------------------------------------------------------------------------
+- Vấn đề: Trên vi điều khiển không có PSRAM, khi chạy đồng thời WiFi STA +
+  HTTP Stream Client + HTTP Web Server, nếu cấp phát `StreamBuffer` quá lớn
+  (ví dụ 48KB), Heap nội còn lại quá ít (< 50KB). Khi trình duyệt truy cập địa chỉ
+  IP của thiết bị, trình duyệt mở 4-6 kết nối TCP song song khiến lwIP không cấp
+  phát được `netconn`/`tcp_pcb` và báo lỗi `httpd_accept_conn: error in accept (113)`
+  (`ECONNABORTED`), làm người dùng không vào được trang Web.
+- Giải pháp:
+  1. Giữ **Ngân sách Heap Nội Trống tối thiểu >= 85 KB** sau khi khởi tạo toàn bộ
+     các Task và Buffer:
+     - Cân đối `STREAM_BUF_SIZE_BYTES = 16 KB`, `PREBUFFER = 4 KB` (đủ > 2 giây
+       nhạc nén nhưng tiết kiệm 32KB RAM cho TCP/IP stack).
+  2. Cấu hình máy chủ HTTP (`esp_http_server`) chặt chẽ:
+     - `config.max_open_sockets = 4` (để không vượt quá `CONFIG_LWIP_MAX_SOCKETS = 10`
+       khi cộng thêm 3 socket nội bộ của httpd và 1 socket của `http_stream_task`).
+     - `config.lru_purge_enable = true` (tự động thu hồi socket cũ nhất khi có kết
+       nối mới).
+     - `config.recv_wait_timeout = 3`, `config.send_wait_timeout = 3`.
+     - Luôn gửi header `Connection: close` trong mọi HTTP response và xử lý
+       `/favicon.ico` trả về `204 No Content` để trình duyệt đóng socket ngay lập tức.
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 7: TỰ ĐỘNG KHÔI PHỤC WIFI ĐA NAMESPACE NVS & HIỂN THỊ IP TRỰC QUAN
+--------------------------------------------------------------------------------
+- Giải pháp:
+  1. Khi khởi động, kiểm tra cấu hình WiFi STA theo thứ tự ưu tiên:
+     - Namespace NVS mới (`"wifi_cfg"`) -> Namespace NVS kế thừa (`"wifi-radio"`)
+     - Cấu hình WiFi lưu sẵn trong phân vùng NVS mặc định của SDK (`esp_wifi_get_config`).
+     - Nếu chưa có hoặc kết nối thất bại sau N lần thử, tự động duy trì SoftAP
+       (`ESP32-WebRadio-AP`, IP `192.168.4.1`) để người dùng cấu hình qua Web.
+  2. Ngay khi sự kiện `IP_EVENT_STA_GOT_IP` xảy ra, lưu chuỗi IP vào `g_radio.wifi_ip`,
+     bật cờ `BIT_UI_TITLE_DIRTY` để `ui_render_task` vẽ ngay địa chỉ IP lên góc trên
+     bên trái màn hình (`Y: 0..15`), giúp người dùng biết chính xác địa chỉ truy cập
+     mà không cần cắm cáp Serial Monitor.
+
+================================================================================
+PHẦN 4: HƯỚNG DẪN KẾ THỪA & PORTING SANG CHIP KHÁC / MODULE KHÁC
+================================================================================
+
+Khi người dùng yêu cầu chuyển đổi dự án này sang phần cứng mới, AI cần giữ nguyên
+100% tầng Logic (`g_radio`, `EventGroup`, `StreamBuffer`, thuật toán vẽ Scanline
+và bảng LUT lượng giác) và chỉ thay đổi lớp trừu tượng phần cứng (HAL) theo bảng sau:
+
+1. KẾ THỪA SANG DÒNG CHIP VI ĐIỀU KHIỂN KHÁC:
+   - ESP32-S3 (Dual-Core Xtensa LX7):
+     + Giữ nguyên kiến trúc Core 0 / Core 1. Nếu chip có PSRAM (Octal/Quad SPIRAM),
+       có thể tăng `STREAM_BUF_SIZE_BYTES` lên 128KB-256KB trong PSRAM, nhưng
+       BẮT BUỘC giữ `s_bar_buf` (SPI DMA buffer) trong Internal SRAM (`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`).
+   - ESP32-C3 / ESP32-C6 (Single-Core RISC-V):
+     + Đổi `xTaskCreatePinnedToCore(..., 0/1)` thành `xTaskCreate(...)` (hoặc
+       `tskNO_AFFINITY`). Giữ nguyên phân cấp Priority (`16 > 15 > 7 > 5 > 4`).
+   - STM32H7 / STM32F4 + FreeRTOS + LwIP:
+     + Thay `esp_lcd_panel_draw_bitmap` bằng `HAL_SPI_Transmit_DMA(&hspiX, ...)`
+       và nhả `s_lcd_dma_sem` bên trong `HAL_SPI_TxCpltCallback()`.
+     + Thay `i2s_channel_write` bằng `HAL_I2S_Transmit_DMA()` với cơ chế Ping-Pong
+       Half/Full Complete Callback đọc từ `StreamBuffer`.
+   - RP2040 / RP2350 (Pico W / Pico 2 W + FreeRTOS SMP):
+     + Dùng PIO I2S cho xuất âm thanh DMA và SPI DMA channel cho màn hình TFT;
+       giữ nguyên toàn bộ code `ui_st7789.c` và `radio_system_state_t`.
+
+2. KẾ THỪA SANG MODULE MÀN HÌNH KHÁC:
+   - Màn hình tròn GC9A01 (240x240 SPI):
+     + Giữ nguyên 100% thuật toán vẽ đĩa than, chỉ cần thay chuỗi khởi tạo panel
+       từ ST7789 sang GC9A01 và căn tâm đĩa về `(120, 120)`.
+   - Màn hình ILI9341 / ST7796 (320x240 hoặc 320x480):
+     + Tăng `TFT_WIDTH` / `TFT_HEIGHT` trong `radio_config.h`, giữ nguyên cơ chế
+       chia Strip `s_bar_buf` để không tốn thêm RAM.
+   - Màn hình OLED SSD1306 / SH1106 (128x64 I2C/SPI Monochrome):
+     + Ánh xạ ngưỡng màu RGB565 sang 1-bit monochrome, giảm bán kính đĩa than
+       `DISC_OUTER_R` xuống 24px.
+
+3. KẾ THỪA SANG MODULE ÂM THANH / DAC KHÁC:
+   - PCM5102A (I2S DAC không cần I2C):
+     + Giữ nguyên cấu hình I2S Standard (`DIN`, `BCLK`, `LRC`), nối chân `XSMT`
+       (Soft Mute) của PCM5102A vào `GPIO 33` (logic giống hệt chân `SD` của MAX98357A:
+       `0` = Mute, `1` = Unmute).
+   - ES8388 / WM8960 / TLV320AIC3100 (I2S + I2C Codec):
+     + Giữ nguyên đường dữ liệu I2S DMA; thay hàm `audio_hw_set_mute()` từ điều
+       khiển GPIO sang ghi thanh ghi Mute qua I2C (hoặc kết hợp cả GPIO Amp Enable).
+
+4. KẾ THỪA SANG NGUỒN PHÁT ÂM THANH KHÁC:
+   - Thẻ nhớ SD (SDMMC/SPI) hoặc Flash (LittleFS) hoặc Bluetooth A2DP Sink:
+     + Chỉ cần thay thế ruột của `http_stream_task` bằng luồng đọc file/Bluetooth
+       đẩy dữ liệu vào cùng `g_radio.audio_stream_buf` và cập nhật `g_radio.song_title`
+       kèm cờ `BIT_UI_TITLE_DIRTY`. Toàn bộ tầng Audio I2S, Nút nhấn và UI ST7789
+       hoạt động nguyên vẹn mà không cần sửa đổi.
+
+================================================================================
+PHẦN 5: CHECKLIST KIỂM TRA CHẤT LƯỢNG KHI AI SINH CODE MỚI
+================================================================================
+Trước khi xuất code cho người dùng, AI phải tự kiểm tra:
+[ ] 1. Không có `malloc`/`new`/`String` trong vòng lặp runtime của các Task.
+[ ] 2. Không có `float`/`double`/`sinf`/`cosf`/`sqrt` trong hàm vẽ UI từng frame.
+[ ] 3. Mọi lần truyền SPI DMA đều đợi Semaphore hoàn tất trước khi ghi đè buffer.
+[ ] 4. Khi nhấn Pause, phần cứng âm thanh phải được Mute trước khi dừng luồng dữ liệu.
+[ ] 5. Tổng RAM tĩnh (`.bss` + `.data`) dưới 25% và Heap trống khi chạy > 85 KB.
+[ ] 6. Biên dịch sạch sẽ (`0 errors, 0 warnings`) với cờ tối ưu `-O2`.
+================================================================================
