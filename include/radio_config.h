@@ -23,19 +23,18 @@ extern "C" {
 /* =========================================================================
  * 1. SO DO CHAN PHAN CUNG CO DINH (FIXED HARDWARE PINOUT)
  * ========================================================================= */
-/* Man hinh TFT 1.54" ST7789 (240x240, SPI2_HOST, 40MHz, CS-less) */
+/* Man hinh TFT 1.54" ST7789 (240x240, SPI2_HOST, esp_lcd DMA) */
 #define PIN_TFT_SCL             GPIO_NUM_18
 #define PIN_TFT_SDA             GPIO_NUM_23
 #define PIN_TFT_RES             GPIO_NUM_4
 #define PIN_TFT_DC              GPIO_NUM_2
 #define PIN_TFT_BLK             GPIO_NUM_32
-#define PIN_TFT_CS_NONE         (-1)            /* Module ST7789 khong dung CS */
-#define PIN_TFT_CS_COMPAT_1     GPIO_NUM_5      /* Keo LOW phu tro neu module co CS noi GPIO 5 */
+#define PIN_TFT_CS_HW           GPIO_NUM_5      /* Tuong thich ca man CS=GPIO5 lan man CS-less */
 #define PIN_TFT_CS_COMPAT_2     GPIO_NUM_15     /* Keo LOW phu tro neu module co CS noi GPIO 15 */
 
 #define TFT_WIDTH               240
 #define TFT_HEIGHT              240
-#define TFT_SPI_CLOCK_HZ        (40 * 1000 * 1000) /* 40 MHz SPI Clock */
+#define TFT_SPI_CLOCK_HZ        (27 * 1000 * 1000) /* 27 MHz SPI DMA (on dinh tuyet doi tren day cam) */
 
 /* IC Khuech dai & DAC I2S MAX98357A */
 #define PIN_I2S_DIN             GPIO_NUM_25
@@ -104,6 +103,7 @@ typedef struct {
     char                station_name[32];
     char                song_title[128];
     char                stream_url[160];
+    char                sta_ip[20];
 
     /* Cac bien trang thai nguyen tu (<stdatomic.h>) truy cap khong can lock */
     atomic_bool         is_playing;         /* true = PLAY, false = PAUSE */
@@ -143,6 +143,8 @@ void radio_state_set_station(const char *name, const char *url, uint8_t index);
 void radio_state_set_song_title(const char *title);
 void radio_state_get_strings(char *out_station, size_t station_len,
                              char *out_title, size_t title_len);
+void radio_state_set_ip(const char *ip_str);
+void radio_state_get_ip(char *out_ip, size_t ip_len);
 void radio_state_set_volume(uint8_t vol_pct);
 void radio_state_cycle_station(int delta);
 

@@ -12,6 +12,7 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "RADIO_MAIN";
@@ -20,10 +21,10 @@ static const char *TAG = "RADIO_MAIN";
  * Danh sach kenh Internet Radio mac dinh luu trong Flash (Const)
  * ========================================================================= */
 static const radio_station_preset_t kRadioPresets[] = {
-    { "VOV3 STEREO",   "http://stream.kythuatvov.vn:7005/;" },
-    { "LOFI CHILL FM", "http://usa9.fastcast4u.com/proxy/jamz?mp=/1" },
-    { "JAZZ GROOVE",   "http://jazz-wr04.ice.infomaniak.ch/jazz-wr04-128.mp3" },
-    { "CLASSIC VINYL", "http://ice1.somafm.com/seventies-128-mp3" }
+    { "Coastal Letters", "http://ice1.somafm.com/seventies-128-mp3" },
+    { "Lofi Groove",     "http://ice1.somafm.com/groovesalad-128-mp3" },
+    { "Lush Chill",      "http://ice1.somafm.com/lush-128-mp3" },
+    { "Retro Synth",     "http://ice1.somafm.com/defcon-128-mp3" }
 };
 #define NUM_RADIO_PRESETS (sizeof(kRadioPresets) / sizeof(kRadioPresets[0]))
 
@@ -94,6 +95,32 @@ void radio_state_get_strings(char *out_station, size_t station_len,
     }
 }
 
+void radio_state_set_ip(const char *ip_str)
+{
+    if (xSemaphoreTake(g_radio_state.mutex, portMAX_DELAY) == pdTRUE) {
+        if (ip_str != NULL) {
+            strncpy(g_radio_state.sta_ip, ip_str, sizeof(g_radio_state.sta_ip) - 1);
+            g_radio_state.sta_ip[sizeof(g_radio_state.sta_ip) - 1] = '\0';
+        } else {
+            g_radio_state.sta_ip[0] = '\0';
+        }
+        xSemaphoreGive(g_radio_state.mutex);
+    }
+    ui_st7789_notify(UI_NOTIFY_WIFI);
+}
+
+void radio_state_get_ip(char *out_ip, size_t ip_len)
+{
+    if (out_ip == NULL || ip_len == 0) {
+        return;
+    }
+    if (xSemaphoreTake(g_radio_state.mutex, portMAX_DELAY) == pdTRUE) {
+        strncpy(out_ip, g_radio_state.sta_ip, ip_len - 1);
+        out_ip[ip_len - 1] = '\0';
+        xSemaphoreGive(g_radio_state.mutex);
+    }
+}
+
 void radio_state_set_volume(uint8_t vol_pct)
 {
     if (vol_pct > 100U) {
@@ -125,9 +152,15 @@ void radio_state_cycle_station(int delta)
  * ========================================================================= */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "==========================================================");
-    ESP_LOGI(TAG, " ESP32 WIFI WEB RADIO - PURE ESP-IDF v5.3+ FREERTOS ARCH  ");
-    ESP_LOGI(TAG, "==========================================================");
+    /* Tat log loi noi bo cua esp-tls / HTTP_CLIENT khi server radio timeout */
+    esp_log_level_set("esp-tls",        ESP_LOG_NONE);
+    esp_log_level_set("transport_base", ESP_LOG_NONE);
+    esp_log_level_set("HTTP_CLIENT",    ESP_LOG_NONE);
+
+    printf("\n==========================================================\n");
+    printf(" ESP32 WIFI WEB RADIO - PURE ESP-IDF v5.3+ FREERTOS ARCH  \n");
+    printf("==========================================================\n");
+    ESP_LOGI(TAG, "Booting ESP32 WiFi Web Radio...");
 
     /* 1. Khoi tao NVS Flash phuc vu WiFi & Luu cau hinh */
     esp_err_t ret = nvs_flash_init();
@@ -144,7 +177,7 @@ void app_main(void)
 
     strncpy(g_radio_state.station_name, kRadioPresets[0].name, sizeof(g_radio_state.station_name) - 1);
     strncpy(g_radio_state.stream_url,   kRadioPresets[0].url,  sizeof(g_radio_state.stream_url) - 1);
-    strncpy(g_radio_state.song_title,   "Eagles - Hotel California (Vintage Vinyl Stream)",
+    strncpy(g_radio_state.song_title,   "June Halberd - Slow River",
             sizeof(g_radio_state.song_title) - 1);
 
     g_radio_state.volume        = 75;
@@ -178,6 +211,7 @@ void app_main(void)
     /* 7. Khoi tao WiFi APSTA (WIFI_PS_NONE) & Web Server (Core 0, Priority 5) */
     ESP_ERROR_CHECK(wifi_web_init());
 
-    ESP_LOGI(TAG, "All FreeRTOS tasks running. Internal free heap: %u bytes",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    printf("[RADIO_MAIN] All FreeRTOS tasks running! Free internal heap: %u bytes\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    printf("[RADIO_MAIN] Press BOOT (GPIO 0) to Toggle Play/Pause instantly.\n");
 }

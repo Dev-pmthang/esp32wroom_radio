@@ -2,7 +2,7 @@
  * wifi_web.c
  * Quan ly WiFi STA/AP (esp_wifi_set_ps(WIFI_PS_NONE) chong nhieu nguon)
  * va Embedded Web Server dieu khien Radio (esp_http_server) tren Core 0 (Priority 5).
- * Hoan toan Zero-Malloc trong cac HTTP Handler.
+ * Tu dong cap nhat dia chi IP len goc trai man hinh ST7789 ngay khi ket noi WiFi thanh cong.
  */
 #include "wifi_web.h"
 #include "radio_config.h"
@@ -29,42 +29,74 @@ static EventGroupHandle_t s_wifi_evt_group = NULL;
 static StaticEventGroup_t s_wifi_evt_storage;
 static httpd_handle_t     s_http_server    = NULL;
 
-/* Giao dien Web dieu khien luu co dinh trong Flash (Zero RAM) */
+/* Giao dien Web dieu khien + Cau hinh WiFi luu co dinh trong Flash (Zero RAM) */
 static const char kWebIndexHtml[] =
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>ESP32 Vintage Web Radio</title>"
+    "<title>ESP32 Vinyl Player</title>"
     "<style>"
-    "body{background:#100d0a;color:#faeed4;font-family:sans-serif;text-align:center;padding:18px;}"
-    ".card{max-width:380px;margin:auto;background:#1a140f;border:2px solid #735830;border-radius:12px;padding:18px;}"
-    "h2{color:#ffb240;margin:0 0 8px 0;}"
-    ".meta{color:#e8d6af;min-height:40px;margin:10px 0;font-size:15px;}"
-    "button{background:#221b14;color:#faeed4;border:1px solid #cda45c;border-radius:8px;padding:10px 18px;margin:6px;font-size:15px;cursor:pointer;}"
-    "button.play{background:#ffb240;color:#100d0a;font-weight:bold;}"
-    "input[type=range]{width:85%;accent-color:#ffb240;}"
+    "body{background:#f4f1ea;color:#1c1c1c;font-family:sans-serif;text-align:center;padding:18px;}"
+    ".card{max-width:380px;margin:auto;background:#ffffff;border:1px solid #d4cfc4;border-radius:16px;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}"
+    "h2{color:#1c1c1c;margin:0 0 4px 0;}"
+    ".sub{color:#847e76;font-size:14px;margin-bottom:14px;}"
+    ".ip{color:#c24b38;font-size:12px;font-weight:bold;margin-bottom:10px;}"
+    "button{background:#e4e0d7;color:#1c1c1c;border:0;border-radius:20px;padding:10px 18px;margin:6px;font-size:15px;cursor:pointer;}"
+    "button.play{background:#c24b38;color:#ffffff;font-weight:bold;padding:12px 24px;}"
+    "input[type=range]{width:85%;accent-color:#c24b38;}"
+    "input[type=text],input[type=password]{width:82%;padding:8px;margin:4px 0;border:1px solid #d0cbc2;border-radius:8px;}"
     "</style></head><body><div class='card'>"
-    "<h2 id='st'>ESP32 RADIO</h2>"
-    "<div class='meta' id='ti'>Loading...</div>"
+    "<div class='ip' id='ip'>IP: Connecting...</div>"
+    "<h2 id='ti'>Slow River</h2>"
+    "<div class='sub' id='st'>Coastal Letters</div>"
     "<div>"
     "<button onclick=\"act('/api/prev')\">&laquo; Prev</button>"
-    "<button class='play' id='pb' onclick=\"act('/api/toggle')\">Play / Pause</button>"
+    "<button class='play' id='pb' onclick=\"act('/api/toggle')\">PAUSE</button>"
     "<button onclick=\"act('/api/next')\">Next &raquo;</button>"
     "</div><div style='margin-top:14px'>"
     "Volume: <span id='vv'>75</span>%<br>"
     "<input type='range' id='vr' min='0' max='100' value='75' onchange='setVol(this.value)'>"
-    "</div></div>"
+    "</div><hr style='border:0;border-top:1px solid #e4e0d7;margin:16px 0'>"
+    "<div style='font-size:13px;color:#847e76'>WiFi Configuration</div>"
+    "<input type='text' id='ws' placeholder='WiFi SSID'><br>"
+    "<input type='password' id='wp' placeholder='WiFi Password'><br>"
+    "<button onclick='saveWifi()'>Save &amp; Connect WiFi</button>"
+    "</div>"
     "<script>"
     "function act(u){fetch(u,{method:'POST'}).then(()=>poll());}"
     "function setVol(v){document.getElementById('vv').innerText=v;fetch('/api/volume?val='+v,{method:'POST'});}"
+    "function saveWifi(){const s=encodeURIComponent(document.getElementById('ws').value);"
+    "const p=encodeURIComponent(document.getElementById('wp').value);"
+    "fetch('/api/wifi?ssid='+s+'&pass='+p,{method:'POST'}).then(()=>alert('Connecting to WiFi...'));}"
     "function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{"
     "document.getElementById('st').innerText=d.station;"
     "document.getElementById('ti').innerText=d.title;"
+    "document.getElementById('ip').innerText=d.ip?('WiFi IP: '+d.ip):'AP Mode: 192.168.4.1';"
     "document.getElementById('pb').innerText=d.playing?'PAUSE':'PLAY';"
     "document.getElementById('vv').innerText=d.volume;"
     "document.getElementById('vr').value=d.volume;"
     "}).catch(()=>{});}"
-    "setInterval(poll,1500);poll();"
+    "setInterval(poll,1200);poll();"
     "</script></body></html>";
+
+/* Giải mã URL-encoded cơ bản tại chỗ (Zero Malloc) */
+static void url_decode_inplace(char *str)
+{
+    char *src = str;
+    char *dst = str;
+    while (*src) {
+        if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else if (*src == '%' && src[1] && src[2]) {
+            char hex[3] = { src[1], src[2], '\0' };
+            *dst++ = (char)strtol(hex, NULL, 16);
+            src += 3;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
 
 /* =========================================================================
  * Cac HTTP Handlers (Su dung buffer tinh tren stack, Zero Malloc)
@@ -79,16 +111,18 @@ static esp_err_t http_get_status_handler(httpd_req_t *req)
 {
     char station[32];
     char title[128];
-    char json_buf[320];
+    char ip_str[20];
+    char json_buf[360];
 
     radio_state_get_strings(station, sizeof(station), title, sizeof(title));
+    radio_state_get_ip(ip_str, sizeof(ip_str));
     bool playing   = atomic_load(&g_radio_state.is_playing);
     bool buffering = atomic_load(&g_radio_state.is_buffering);
 
     int len = snprintf(
         json_buf, sizeof(json_buf),
-        "{\"station\":\"%s\",\"title\":\"%s\",\"playing\":%s,\"buffering\":%s,\"volume\":%u,\"rssi\":%d}",
-        station, title,
+        "{\"station\":\"%s\",\"title\":\"%s\",\"ip\":\"%s\",\"playing\":%s,\"buffering\":%s,\"volume\":%u,\"rssi\":%d}",
+        station, title, ip_str,
         playing ? "true" : "false",
         buffering ? "true" : "false",
         (unsigned)g_radio_state.volume,
@@ -136,16 +170,49 @@ static esp_err_t http_post_volume_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+static esp_err_t http_post_wifi_handler(httpd_req_t *req)
+{
+    char query[128];
+    char ssid[33] = {0};
+    char pass[65] = {0};
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        (void)httpd_query_key_value(query, "ssid", ssid, sizeof(ssid));
+        (void)httpd_query_key_value(query, "pass", pass, sizeof(pass));
+        url_decode_inplace(ssid);
+        url_decode_inplace(pass);
+
+        if (ssid[0] != '\0') {
+            nvs_handle_t nvs;
+            if (nvs_open("wifi_cfg", NVS_READWRITE, &nvs) == ESP_OK) {
+                nvs_set_str(nvs, "ssid", ssid);
+                nvs_set_str(nvs, "pass", pass);
+                nvs_commit(nvs);
+                nvs_close(nvs);
+            }
+            wifi_config_t sta_cfg = { 0 };
+            strncpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid) - 1);
+            strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
+            esp_wifi_disconnect();
+            esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+            esp_wifi_connect();
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 static void start_web_server(void)
 {
     if (s_http_server != NULL) {
         return;
     }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.core_id      = CORE_NETWORK_CTRL;
-    config.task_priority = TASK_PRIO_WIFI_WEB;
-    config.stack_size   = 4096;
+    config.core_id          = CORE_NETWORK_CTRL;
+    config.task_priority    = TASK_PRIO_WIFI_WEB;
+    config.stack_size       = 4096;
     config.lru_purge_enable = true;
+    config.max_uri_handlers = 8;
 
     if (httpd_start(&s_http_server, &config) == ESP_OK) {
         static const httpd_uri_t u_root   = { .uri = "/",           .method = HTTP_GET,  .handler = http_get_root_handler };
@@ -154,6 +221,7 @@ static void start_web_server(void)
         static const httpd_uri_t u_next   = { .uri = "/api/next",   .method = HTTP_POST, .handler = http_post_next_handler };
         static const httpd_uri_t u_prev   = { .uri = "/api/prev",   .method = HTTP_POST, .handler = http_post_prev_handler };
         static const httpd_uri_t u_vol    = { .uri = "/api/volume", .method = HTTP_POST, .handler = http_post_volume_handler };
+        static const httpd_uri_t u_wifi   = { .uri = "/api/wifi",   .method = HTTP_POST, .handler = http_post_wifi_handler };
 
         httpd_register_uri_handler(s_http_server, &u_root);
         httpd_register_uri_handler(s_http_server, &u_status);
@@ -161,6 +229,7 @@ static void start_web_server(void)
         httpd_register_uri_handler(s_http_server, &u_next);
         httpd_register_uri_handler(s_http_server, &u_prev);
         httpd_register_uri_handler(s_http_server, &u_vol);
+        httpd_register_uri_handler(s_http_server, &u_wifi);
 
         ESP_LOGI(TAG, "esp_http_server started on port 80 (Core 0)");
     }
@@ -179,15 +248,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         atomic_store(&g_radio_state.wifi_connected, false);
         xEventGroupClearBits(g_radio_event_group, EVT_WIFI_CONNECTED);
         xEventGroupSetBits(s_wifi_evt_group, WIFI_INTERNAL_STA_DISCONN);
-        ui_st7789_notify(UI_NOTIFY_WIFI);
+        radio_state_set_ip("");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "WiFi STA Connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        char ip_buf[20];
+        snprintf(ip_buf, sizeof(ip_buf), IPSTR, IP2STR(&event->ip_info.ip));
+
+        printf("[WIFI_WEB] WiFi Connected! STA IP: %s\n", ip_buf);
+        ESP_LOGI(TAG, "WiFi STA Connected! IP: %s", ip_buf);
 
         atomic_store(&g_radio_state.wifi_connected, true);
+        radio_state_set_ip(ip_buf);
+
         xEventGroupSetBits(g_radio_event_group, EVT_WIFI_CONNECTED);
         xEventGroupSetBits(s_wifi_evt_group, WIFI_INTERNAL_STA_GOT_IP);
-        ui_st7789_notify(UI_NOTIFY_WIFI);
     }
 }
 
@@ -202,17 +276,15 @@ static void wifi_and_web_task(void *arg)
     start_web_server();
 
     for (;;) {
-        /* Cho su kien mat ket noi hoac timeout 3 giay de cap nhat RSSI (Zero busy-wait) */
         EventBits_t bits = xEventGroupWaitBits(
             s_wifi_evt_group,
             WIFI_INTERNAL_STA_DISCONN | WIFI_INTERNAL_STA_GOT_IP,
             pdTRUE,
             pdFALSE,
-            pdMS_TO_TICKS(3000)
+            pdMS_TO_TICKS(5000)
         );
 
         if ((bits & WIFI_INTERNAL_STA_DISCONN) != 0) {
-            /* Tu dong ket noi lai STA neu bi rot mang */
             esp_wifi_connect();
         }
 
@@ -247,7 +319,7 @@ esp_err_t wifi_web_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
-    /* Doc SSID/Password luu trong NVS (neu co) */
+    /* Doc SSID/Password luu trong NVS (ho tro ca namespace "wifi_cfg" va "wifi-radio" cu) */
     wifi_config_t sta_cfg = { 0 };
     nvs_handle_t nvs;
     if (nvs_open("wifi_cfg", NVS_READONLY, &nvs) == ESP_OK) {
@@ -257,20 +329,28 @@ esp_err_t wifi_web_init(void)
         (void)nvs_get_str(nvs, "pass", (char *)sta_cfg.sta.password, &p_len);
         nvs_close(nvs);
     }
+    if (sta_cfg.sta.ssid[0] == '\0' && nvs_open("wifi-radio", NVS_READONLY, &nvs) == ESP_OK) {
+        size_t s_len = sizeof(sta_cfg.sta.ssid);
+        size_t p_len = sizeof(sta_cfg.sta.password);
+        (void)nvs_get_str(nvs, "ssid", (char *)sta_cfg.sta.ssid, &s_len);
+        (void)nvs_get_str(nvs, "pass", (char *)sta_cfg.sta.password, &p_len);
+        nvs_close(nvs);
+    }
 
     wifi_config_t ap_cfg = {
         .ap = {
-            .ssid = "ESP32-WebRadio",
-            .ssid_len = 14,
+            .ssid = "WIFI_RADIO",
+            .ssid_len = 10,
             .channel = 1,
-            .password = "",
+            .password = "12345678",
             .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
         },
     };
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     if (sta_cfg.sta.ssid[0] != '\0') {
+        printf("[WIFI_WEB] Connecting to saved WiFi SSID: %s\n", (char *)sta_cfg.sta.ssid);
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     }
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
@@ -292,6 +372,6 @@ esp_err_t wifi_web_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "WiFi APSTA initialized (WIFI_PS_NONE active, SoftAP: ESP32-WebRadio)");
+    ESP_LOGI(TAG, "WiFi APSTA initialized (WIFI_PS_NONE active, SoftAP: WIFI_RADIO)");
     return ESP_OK;
 }
