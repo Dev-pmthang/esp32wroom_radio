@@ -256,6 +256,33 @@ GIẢI THUẬT 7: TỰ ĐỘNG KHÔI PHỤC WIFI ĐA NAMESPACE NVS & HIỂN TH�
      bật cờ `BIT_UI_TITLE_DIRTY` để `ui_render_task` vẽ ngay địa chỉ IP lên góc trên
      bên trái màn hình (`Y: 0..15`), giúp người dùng biết chính xác địa chỉ truy cập
      mà không cần cắm cáp Serial Monitor.
+  3. Khi đã kết nối WiFi Router (STA) và không có client nào bám vào SoftAP, chuyển
+     tạm sang `WIFI_MODE_STA` để triệt tiêu độ trễ beacon 102.4ms của SoftAP (tự động
+     khôi phục `WIFI_MODE_APSTA` ngay nếu STA mất kết nối).
+
+--------------------------------------------------------------------------------
+GIẢI THUẬT 8: STREAMING VIDEO MP4 20-24 FPS (WS-JPEG + TRIPLE-BUFFER + PING-PONG DMA)
+--------------------------------------------------------------------------------
+- Vấn đề: Truyền ảnh RGB565 thô (`40,960 B`) qua HTTP POST Stop-and-Wait bị nghẽn
+  cửa sổ `CONFIG_LWIP_TCP_WND_DEFAULT = 5760 B` (chờ ACK 7 lần/frame) và RTT WiFi
+  khiến tốc độ bị giới hạn ở `6-8 FPS`.
+- Giải pháp (Tăng tốc lên `20-24 FPS`, tiết kiệm Flash 100%):
+  1. **WebSocket `/ws` + Nén JPEG phía trình duyệt (`cv.toBlob(..., 0.72)`):**
+     Giảm mỗi khung hình `128x160` từ `41 KB` xuống `~3-6 KB` (vừa khít 1 cửa sổ
+     `TCP_WND = 5760 B`), bật `TCP_NODELAY` và dùng Sliding Window `MAX_INFLIGHT = 3`
+     với `requestVideoFrameCallback` + `ws.send(blob)` zero-copy.
+  2. **Wait-Free Triple-Buffer Dual-Core (`3 x 10 KB` tĩnh trong `.bss`):**
+     Core 0 (`httpd`) nhận frame WebSocket vào slot trống và trả ACK `< 1ms` ngay
+     lập tức, không chờ giải mã; Core 1 (`ui_render_task` tạm nâng lên Priority 12)
+     lấy slot mới nhất để giải mã song song.
+  3. **Giải mã bằng ESP32 ROM (`esp32/rom/tjpgd.h`) + Ping-Pong Async SPI DMA:**
+     Không tốn bộ nhớ Flash cho thư viện JPEG; chia đôi `s_bar_buf` (`19.2 KB`) làm
+     2 nửa Ping-Pong (`9.6 KB/nửa`) để Core 1 giải mã strip kế tiếp trong lúc SPI2 DMA
+     (`20 MHz`) đang đẩy strip trước ra màn hình.
+  4. **Khử nhiễu hạt ST7735 (`128x160`):**
+     Giữ `CASET (0..127)` với `Offset (0, 0)` tránh tràn cột gây xéo hình; nạp `INVCTR
+     0xB4 = 0x07` (Line Inversion), `PWCTR/VMCTR1/Gamma`, vòng tròn `R^2 +- R` và bật
+     `ctx.imageSmoothingQuality = 'medium'` khi co giãn video HD.
 
 ================================================================================
 PHẦN 4: HƯỚNG DẪN KẾ THỪA & PORTING SANG CHIP KHÁC / MODULE KHÁC

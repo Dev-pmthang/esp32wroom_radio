@@ -14,7 +14,9 @@
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_system.h"
 #include "esp_log.h"
+#include "lwip/sockets.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +46,7 @@ static const char kWebIndexHtml[] =
     "button{background:#e4e0d7;color:#1c1c1c;border:0;border-radius:20px;padding:10px 18px;margin:6px;font-size:15px;cursor:pointer;}"
     "button.play{background:#c24b38;color:#ffffff;font-weight:bold;padding:12px 24px;}"
     "input[type=range]{width:85%;accent-color:#c24b38;}"
-    "input[type=text],input[type=password]{width:82%;padding:8px;margin:4px 0;border:1px solid #d0cbc2;border-radius:8px;}"
+    "input[type=text],input[type=password],select{width:82%;padding:8px;margin:4px 0;border:1px solid #d0cbc2;border-radius:8px;}"
     "</style></head><body><div class='card'>"
     "<div class='ip' id='ip'>IP: Connecting...</div>"
     "<h2 id='ti'>Slow River</h2>"
@@ -57,24 +59,98 @@ static const char kWebIndexHtml[] =
     "Volume: <span id='vv'>75</span>%<br>"
     "<input type='range' id='vr' min='0' max='100' value='75' onchange='setVol(this.value)'>"
     "</div><hr style='border:0;border-top:1px solid #e4e0d7;margin:16px 0'>"
+    "<div style='font-size:13px;color:#c24b38;font-weight:bold'>Ph&aacute;t Video (.MP4) l&ecirc;n M&agrave;n h&igrave;nh TFT</div>"
+    "<input type='file' id='vf' accept='video/*' style='margin:8px 0;font-size:13px;width:90%'><br>"
+    "<select id='vfit' style='width:82%;padding:6px;margin:4px 0'>"
+    "<option value='cover'>Full Screen (C&#259;n tr&agrave;n m&agrave;n h&igrave;nh)</option>"
+    "<option value='contain'>Fit (Gi&#7919; nguy&ecirc;n t&#7927; l&#7879;)</option>"
+    "</select><br>"
+    "<select id='vq' style='width:82%;padding:6px;margin:4px 0'>"
+    "<option value='0.58'>T&#7889;c &#273;&#7897; cao (JPEG 58%)</option>"
+    "<option value='0.72' selected>S&#7855;c n&eacute;t &amp; M&#432;&#7907;t (JPEG 72%)</option>"
+    "<option value='0.84'>Si&ecirc;u n&eacute;t &#237;t nhi&#7877;u (JPEG 84%)</option>"
+    "</select><br>"
+    "<button class='play' onclick='startVid()'>&#9654; Play Video</button>"
+    "<button onclick='stopVid()'>&#9632; Stop Video</button>"
+    "<div id='vst' style='font-size:12px;color:#847e76;margin-top:4px'>Ch&#7885;n file .mp4 &#273;&#7875; ph&aacute;t l&ecirc;n TFT</div>"
+    "<canvas id='cv' width='128' height='160' style='margin-top:6px;border:1px solid #d0cbc2;border-radius:6px;display:none'></canvas>"
+    "<video id='vid' loop playsinline style='display:none'></video>"
+    "<hr style='border:0;border-top:1px solid #e4e0d7;margin:16px 0'>"
+    "<div style='font-size:13px;color:#847e76'>Ch&#7871; &#273;&#7897; m&agrave;n h&igrave;nh LED (LCD Mode)</div>"
+    "<select id='lm'>"
+    "<option value='0'>Mode 0: ST7789 1.54\" (240x240, CS=5)</option>"
+    "<option value='1'>Mode 1: ST7735 1.8\" (128x160, CS=15)</option>"
+    "</select><br>"
+    "<button onclick='saveLcd()'>Apply LCD Mode &amp; Reboot</button>"
+    "<hr style='border:0;border-top:1px solid #e4e0d7;margin:16px 0'>"
     "<div style='font-size:13px;color:#847e76'>WiFi Configuration</div>"
     "<input type='text' id='ws' placeholder='WiFi SSID'><br>"
     "<input type='password' id='wp' placeholder='WiFi Password'><br>"
     "<button onclick='saveWifi()'>Save &amp; Connect WiFi</button>"
     "</div>"
     "<script>"
+    "let lcdInit=false,vRun=false,lcdW=128,lcdH=160,fCnt=0,t0=0,ws=null;"
+    "let inFlight=0,encBusy=false,pending=false,lastVt=-1,lastBytes=0,espMs=0;"
+    "const MAX_INFLIGHT=3;"
+    "const vid=document.getElementById('vid'),cv=document.getElementById('cv'),ctx=cv.getContext('2d',{willReadFrequently:true,alpha:false});"
     "function act(u){fetch(u,{method:'POST'}).then(()=>poll());}"
     "function setVol(v){document.getElementById('vv').innerText=v;fetch('/api/volume?val='+v,{method:'POST'});}"
+    "function saveLcd(){const m=document.getElementById('lm').value;"
+    "fetch('/api/lcd?mode='+m,{method:'POST'}).then(()=>alert('Switching LCD Mode & Rebooting...'));}"
     "function saveWifi(){const s=encodeURIComponent(document.getElementById('ws').value);"
     "const p=encodeURIComponent(document.getElementById('wp').value);"
     "fetch('/api/wifi?ssid='+s+'&pass='+p,{method:'POST'}).then(()=>alert('Connecting to WiFi...'));}"
-    "function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{"
+    "function startVid(){"
+    "const f=document.getElementById('vf').files[0];"
+    "if(!f){alert('Vui long chon file video (.mp4)!');return;}"
+    "cv.width=lcdW;cv.height=lcdH;cv.style.display='inline-block';"
+    "ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='medium';"
+    "vid.src=URL.createObjectURL(f);vRun=true;fCnt=0;t0=performance.now();"
+    "inFlight=0;encBusy=false;pending=true;lastVt=-1;"
+    "if(ws){try{ws.close();}catch(e){}}"
+    "ws=new WebSocket('ws://'+location.host+'/ws');"
+    "ws.binaryType='arraybuffer';"
+    "ws.onopen=()=>{vid.play().then(()=>{scheduleFrame();pump();});};"
+    "ws.onmessage=(ev)=>{if(inFlight>0)inFlight--;espMs=parseInt(ev.data)||0;fCnt++;"
+    "const dt=(performance.now()-t0)/1000;"
+    "if(dt>=0.5){document.getElementById('vst').innerText='WS-JPEG '+lcdW+'x'+lcdH+' @ '+(fCnt/dt).toFixed(1)+' FPS (ESP '+espMs+'ms | '+(lastBytes/1024).toFixed(1)+'KB)';fCnt=0;t0=performance.now();}"
+    "if(vRun)pump();};"
+    "ws.onerror=()=>{if(vRun)document.getElementById('vst').innerText='WS Error, retrying...';};}"
+    "function stopVid(){vRun=false;pending=false;vid.pause();cv.style.display='none';"
+    "if(ws){try{ws.close();}catch(e){}ws=null;}"
+    "document.getElementById('vst').innerText='Da dung phat Video (Quay ve giao dien Dia than)';"
+    "fetch('/api/video_stop',{method:'POST'});}"
+    "function scheduleFrame(){"
+    "if(!vRun)return;"
+    "if(typeof vid.requestVideoFrameCallback==='function'){"
+    "vid.requestVideoFrameCallback(()=>{if(!vRun)return;pending=true;pump();scheduleFrame();});"
+    "}else{"
+    "requestAnimationFrame(()=>{if(!vRun)return;"
+    "if(vid.currentTime!==lastVt){lastVt=vid.currentTime;pending=true;pump();}"
+    "scheduleFrame();});}}"
+    "function pump(){"
+    "if(!vRun||encBusy||!pending||inFlight>=MAX_INFLIGHT||!ws||ws.readyState!==1)return;"
+    "if(vid.paused||vid.ended||ws.bufferedAmount>24576)return;"
+    "pending=false;encBusy=true;"
+    "const vw=vid.videoWidth||lcdW,vh=vid.videoHeight||lcdH,fit=document.getElementById('vfit').value;"
+    "if(fit!=='cover'){ctx.fillStyle='#000';ctx.fillRect(0,0,lcdW,lcdH);}"
+    "const sc=(fit==='cover')?Math.max(lcdW/vw,lcdH/vh):Math.min(lcdW/vw,lcdH/vh);"
+    "const dw=vw*sc,dh=vh*sc,dx=(lcdW-dw)*0.5,dy=(lcdH-dh)*0.5;"
+    "ctx.drawImage(vid,dx,dy,dw,dh);"
+    "const q=parseFloat(document.getElementById('vq').value)||0.72;"
+    "cv.toBlob(b=>{encBusy=false;if(!vRun||!ws||ws.readyState!==1)return;"
+    "if(b&&b.size<=10240){lastBytes=b.size;inFlight++;ws.send(b);}"
+    "else if(b&&b.size>10240){cv.toBlob(b2=>{if(b2&&b2.size<=10240&&vRun&&ws&&ws.readyState===1){lastBytes=b2.size;inFlight++;ws.send(b2);}},'image/jpeg',0.45);}"
+    "if(pending&&inFlight<MAX_INFLIGHT)pump();},'image/jpeg',q);}"
+    "function poll(){if(vRun)return;fetch('/api/status').then(r=>r.json()).then(d=>{"
     "document.getElementById('st').innerText=d.station;"
     "document.getElementById('ti').innerText=d.title;"
     "document.getElementById('ip').innerText=d.ip?('WiFi IP: '+d.ip):'AP Mode: 192.168.4.1';"
     "document.getElementById('pb').innerText=d.playing?'PAUSE':'PLAY';"
     "document.getElementById('vv').innerText=d.volume;"
     "document.getElementById('vr').value=d.volume;"
+    "if(d.w&&d.h){lcdW=d.w;lcdH=d.h;}"
+    "if(!lcdInit&&d.lcd!==undefined){document.getElementById('lm').value=d.lcd;lcdInit=true;}"
     "}).catch(()=>{});}"
     "setInterval(poll,1200);poll();"
     "</script></body></html>";
@@ -128,14 +204,20 @@ static esp_err_t http_get_status_handler(httpd_req_t *req)
     bool playing   = atomic_load(&g_radio_state.is_playing);
     bool buffering = atomic_load(&g_radio_state.is_buffering);
 
+    int16_t lcd_w = 128, lcd_h = 160;
+    ui_st7789_get_resolution(&lcd_w, &lcd_h);
+
     int len = snprintf(
         json_buf, sizeof(json_buf),
-        "{\"station\":\"%s\",\"title\":\"%s\",\"ip\":\"%s\",\"playing\":%s,\"buffering\":%s,\"volume\":%u,\"rssi\":%d}",
+        "{\"station\":\"%s\",\"title\":\"%s\",\"ip\":\"%s\",\"playing\":%s,\"buffering\":%s,\"volume\":%u,\"rssi\":%d,\"lcd\":%u,\"w\":%d,\"h\":%d}",
         station, title, ip_str,
         playing ? "true" : "false",
         buffering ? "true" : "false",
         (unsigned)g_radio_state.volume,
-        (int)g_radio_state.wifi_rssi
+        (int)g_radio_state.wifi_rssi,
+        (unsigned)g_radio_state.lcd_mode,
+        (int)lcd_w,
+        (int)lcd_h
     );
 
     httpd_resp_set_type(req, "application/json");
@@ -217,6 +299,185 @@ static esp_err_t http_post_wifi_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+static esp_err_t http_post_lcd_handler(httpd_req_t *req)
+{
+    char query[32];
+    char mode_str[8];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "mode", mode_str, sizeof(mode_str)) == ESP_OK) {
+            int m = atoi(mode_str);
+            uint8_t new_mode = (m == LCD_MODE_ST7735_128X160)
+                               ? LCD_MODE_ST7735_128X160
+                               : LCD_MODE_ST7789_240X240;
+            nvs_handle_t nvs;
+            if (nvs_open("wifi_cfg", NVS_READWRITE, &nvs) == ESP_OK) {
+                nvs_set_u8(nvs, "lcd_def",  (uint8_t)RADIO_LCD_MODE);
+                nvs_set_u8(nvs, "lcd_mode", new_mode);
+                nvs_commit(nvs);
+                nvs_close(nvs);
+            }
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_hdr(req, "Connection", "close");
+            httpd_resp_sendstr(req, "{\"ok\":true}");
+            vTaskDelay(pdMS_TO_TICKS(300));
+            esp_restart();
+            return ESP_OK;
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_sendstr(req, "{\"ok\":false}");
+}
+
+static esp_err_t http_post_frame_handler(httpd_req_t *req)
+{
+    int16_t lcd_w = 128, lcd_h = 160;
+    ui_st7789_get_resolution(&lcd_w, &lcd_h);
+
+    int expected_total = (int)lcd_w * (int)lcd_h * 2;
+    if (req->content_len != expected_total) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid frame size");
+        return ESP_FAIL;
+    }
+
+    /* Tat Nagle (TCP_NODELAY) de giam do tre phan hoi ACK/HTTP xuong < 1ms */
+    int sock = httpd_req_to_sockfd(req);
+    if (sock >= 0) {
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    }
+
+    uint16_t *dma_buf = ui_st7789_lock_video_buf();
+    if (dma_buf == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "LCD busy");
+        return ESP_FAIL;
+    }
+
+    /* Ping-Pong Async DMA tren 2 nua cua s_bar_buf (moi nua 9,600 B, strip_h = 20):
+     * Trong luc SPI DMA dang day strip N o nua A, WiFi TCP nhan dong thoi strip N+1 vao nua B! */
+    uint8_t *ping_pong[2] = {
+        (uint8_t *)dma_buf,
+        (uint8_t *)dma_buf + (TFT_MAX_WIDTH * 20 * 2)
+    };
+    const int16_t strip_h = 20;
+    uint8_t buf_idx = 0;
+    bool dma_inflight = false;
+
+    for (int16_t y = 0; y < lcd_h; y += strip_h) {
+        int16_t cur_h = (y + strip_h <= lcd_h) ? strip_h : (lcd_h - y);
+        int strip_bytes = (int)lcd_w * (int)cur_h * 2;
+        uint8_t *cur_buf = ping_pong[buf_idx];
+        int received = 0;
+
+        while (received < strip_bytes) {
+            int r = httpd_req_recv(req, (char *)(cur_buf + received), strip_bytes - received);
+            if (r <= 0) {
+                if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+                    continue;
+                }
+                ui_st7789_wait_video_dma(&dma_inflight);
+                ui_st7789_unlock_video_buf();
+                return ESP_FAIL;
+            }
+            received += r;
+        }
+
+        ui_st7789_draw_video_strip_async(y, cur_h, cur_buf, &dma_inflight);
+        buf_idx ^= 1U;
+    }
+
+    ui_st7789_wait_video_dma(&dma_inflight);
+    ui_st7789_unlock_video_buf();
+
+    /* Giu ket noi HTTP Keep-Alive cho /api/frame de dat 20-28 FPS muot ma tren 1 socket */
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "OK", 2);
+}
+
+static esp_err_t http_ws_frame_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        int sock = httpd_req_to_sockfd(req);
+        if (sock >= 0) {
+            int nodelay = 1;
+            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        }
+        ui_st7789_enter_video_mode();
+        return ESP_OK;
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        ui_st7789_stop_video_mode();
+        return ESP_OK;
+    }
+    if (ws_pkt.len == 0) {
+        return ESP_OK;
+    }
+
+    int8_t slot_idx = -1;
+    uint8_t *slot_buf = ui_st7789_video_acquire_slot(&slot_idx, ws_pkt.len);
+    if (slot_buf == NULL) {
+        /* Neu frame vuot qua 10 KB, doc xa sach socket de khong lech khung WS */
+        uint8_t trash[256];
+        size_t rem = ws_pkt.len;
+        while (rem > 0) {
+            size_t chunk = (rem > sizeof(trash)) ? sizeof(trash) : rem;
+            httpd_ws_frame_t dump_pkt = { .payload = trash, .len = chunk };
+            if (httpd_ws_recv_frame(req, &dump_pkt, chunk) != ESP_OK) {
+                break;
+            }
+            rem -= chunk;
+        }
+        goto send_ack;
+    }
+
+    ws_pkt.payload = slot_buf;
+    ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+    if (ret != ESP_OK) {
+        ui_st7789_video_submit_slot(slot_idx, 0);
+        return ret;
+    }
+
+    if (ws_pkt.type == HTTPD_WS_TYPE_BINARY) {
+        /* Nop thang vao Triple Buffer cho Core 1 giai ma + DMA song song, Core 0 ACK TUC THI */
+        ui_st7789_video_submit_slot(slot_idx, ws_pkt.len);
+    } else {
+        ui_st7789_video_submit_slot(slot_idx, 0);
+        return ESP_OK;
+    }
+
+send_ack:
+    {
+        char ack_buf[12];
+        int ack_len = snprintf(ack_buf, sizeof(ack_buf), "%lu",
+                               (unsigned long)ui_st7789_last_decode_ms());
+        httpd_ws_frame_t ack_pkt = {
+            .final      = true,
+            .fragmented = false,
+            .type       = HTTPD_WS_TYPE_TEXT,
+            .payload    = (uint8_t *)ack_buf,
+            .len        = (size_t)ack_len
+        };
+        return httpd_ws_send_frame(req, &ack_pkt);
+    }
+}
+
+static esp_err_t http_post_video_stop_handler(httpd_req_t *req)
+{
+    ui_st7789_stop_video_mode();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 static void start_web_server(void)
 {
     if (s_http_server != NULL) {
@@ -231,25 +492,33 @@ static void start_web_server(void)
     config.lru_purge_enable  = true;
     config.recv_wait_timeout = 3;
     config.send_wait_timeout = 3;
-    config.max_uri_handlers  = 8;
+    config.max_uri_handlers  = 12;
 
     if (httpd_start(&s_http_server, &config) == ESP_OK) {
-        static const httpd_uri_t u_root    = { .uri = "/",            .method = HTTP_GET,  .handler = http_get_root_handler };
-        static const httpd_uri_t u_favicon = { .uri = "/favicon.ico", .method = HTTP_GET,  .handler = http_get_favicon_handler };
-        static const httpd_uri_t u_status  = { .uri = "/api/status",  .method = HTTP_GET,  .handler = http_get_status_handler };
-        static const httpd_uri_t u_toggle  = { .uri = "/api/toggle",  .method = HTTP_POST, .handler = http_post_toggle_handler };
-        static const httpd_uri_t u_next    = { .uri = "/api/next",    .method = HTTP_POST, .handler = http_post_next_handler };
-        static const httpd_uri_t u_prev    = { .uri = "/api/prev",    .method = HTTP_POST, .handler = http_post_prev_handler };
-        static const httpd_uri_t u_vol     = { .uri = "/api/volume",  .method = HTTP_POST, .handler = http_post_volume_handler };
-        static const httpd_uri_t u_wifi    = { .uri = "/api/wifi",    .method = HTTP_POST, .handler = http_post_wifi_handler };
+        static const httpd_uri_t u_root    = { .uri = "/",               .method = HTTP_GET,  .handler = http_get_root_handler };
+        static const httpd_uri_t u_favicon = { .uri = "/favicon.ico",    .method = HTTP_GET,  .handler = http_get_favicon_handler };
+        static const httpd_uri_t u_status  = { .uri = "/api/status",     .method = HTTP_GET,  .handler = http_get_status_handler };
+        static const httpd_uri_t u_ws      = { .uri = "/ws",             .method = HTTP_GET,  .handler = http_ws_frame_handler, .is_websocket = true };
+        static const httpd_uri_t u_toggle  = { .uri = "/api/toggle",     .method = HTTP_POST, .handler = http_post_toggle_handler };
+        static const httpd_uri_t u_next    = { .uri = "/api/next",       .method = HTTP_POST, .handler = http_post_next_handler };
+        static const httpd_uri_t u_prev    = { .uri = "/api/prev",       .method = HTTP_POST, .handler = http_post_prev_handler };
+        static const httpd_uri_t u_vol     = { .uri = "/api/volume",     .method = HTTP_POST, .handler = http_post_volume_handler };
+        static const httpd_uri_t u_lcd     = { .uri = "/api/lcd",        .method = HTTP_POST, .handler = http_post_lcd_handler };
+        static const httpd_uri_t u_frame   = { .uri = "/api/frame",      .method = HTTP_POST, .handler = http_post_frame_handler };
+        static const httpd_uri_t u_vstop   = { .uri = "/api/video_stop", .method = HTTP_POST, .handler = http_post_video_stop_handler };
+        static const httpd_uri_t u_wifi    = { .uri = "/api/wifi",       .method = HTTP_POST, .handler = http_post_wifi_handler };
 
         httpd_register_uri_handler(s_http_server, &u_root);
         httpd_register_uri_handler(s_http_server, &u_favicon);
         httpd_register_uri_handler(s_http_server, &u_status);
+        httpd_register_uri_handler(s_http_server, &u_ws);
         httpd_register_uri_handler(s_http_server, &u_toggle);
         httpd_register_uri_handler(s_http_server, &u_next);
         httpd_register_uri_handler(s_http_server, &u_prev);
         httpd_register_uri_handler(s_http_server, &u_vol);
+        httpd_register_uri_handler(s_http_server, &u_lcd);
+        httpd_register_uri_handler(s_http_server, &u_frame);
+        httpd_register_uri_handler(s_http_server, &u_vstop);
         httpd_register_uri_handler(s_http_server, &u_wifi);
 
         ESP_LOGI(TAG, "esp_http_server started on port 80 (Core 0)");
@@ -306,7 +575,21 @@ static void wifi_and_web_task(void *arg)
         );
 
         if ((bits & WIFI_INTERNAL_STA_DISCONN) != 0) {
+            wifi_mode_t cur_mode = WIFI_MODE_NULL;
+            if (esp_wifi_get_mode(&cur_mode) == ESP_OK && cur_mode != WIFI_MODE_APSTA) {
+                (void)esp_wifi_set_mode(WIFI_MODE_APSTA);
+                (void)esp_wifi_set_ps(WIFI_PS_NONE);
+            }
             esp_wifi_connect();
+        }
+
+        if ((bits & WIFI_INTERNAL_STA_GOT_IP) != 0) {
+            /* Khi STA da ket noi Router thanh cong va khong co ai dung SoftAP -> tat AP beacon de toi uu bang thong/do tre WiFi */
+            wifi_sta_list_t ap_stas = { 0 };
+            if (esp_wifi_ap_get_sta_list(&ap_stas) == ESP_OK && ap_stas.num == 0) {
+                (void)esp_wifi_set_mode(WIFI_MODE_STA);
+                (void)esp_wifi_set_ps(WIFI_PS_NONE);
+            }
         }
 
         if (atomic_load(&g_radio_state.wifi_connected)) {

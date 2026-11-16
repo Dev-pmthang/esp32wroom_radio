@@ -10,6 +10,7 @@
 #include "ui_st7789.h"
 #include "wifi_web.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include <stdio.h>
@@ -182,12 +183,35 @@ void app_main(void)
 
     g_radio_state.volume        = 75;
     g_radio_state.station_index = 0;
+    g_radio_state.lcd_mode      = RADIO_LCD_MODE;
     g_radio_state.wifi_rssi     = -55;
     g_radio_state.disc_angle    = 0;
+
+    /* Doc che do man hinh LED tu NVS (dong bo voi RADIO_LCD_MODE neu vua doi trong code) */
+    {
+        nvs_handle_t nvs;
+        if (nvs_open("wifi_cfg", NVS_READWRITE, &nvs) == ESP_OK) {
+            uint8_t saved_def  = 0xFF;
+            uint8_t saved_mode = RADIO_LCD_MODE;
+            if (nvs_get_u8(nvs, "lcd_def", &saved_def) == ESP_OK &&
+                saved_def == (uint8_t)RADIO_LCD_MODE &&
+                nvs_get_u8(nvs, "lcd_mode", &saved_mode) == ESP_OK) {
+                g_radio_state.lcd_mode = (saved_mode == LCD_MODE_ST7735_128X160)
+                                         ? LCD_MODE_ST7735_128X160
+                                         : LCD_MODE_ST7789_240X240;
+            } else {
+                nvs_set_u8(nvs, "lcd_def",  (uint8_t)RADIO_LCD_MODE);
+                nvs_set_u8(nvs, "lcd_mode", (uint8_t)RADIO_LCD_MODE);
+                nvs_commit(nvs);
+            }
+            nvs_close(nvs);
+        }
+    }
 
     atomic_init(&g_radio_state.is_playing,     true);
     atomic_init(&g_radio_state.is_buffering,   true);
     atomic_init(&g_radio_state.wifi_connected, false);
+    atomic_init(&g_radio_state.is_video_mode,  false);
 
     /* 3. Khoi tao EventGroup Tinh & StreamBuffer (48 KB, Trigger 1024 Bytes) */
     g_radio_event_group = xEventGroupCreateStatic(&s_radio_event_group_storage);

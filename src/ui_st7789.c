@@ -1,8 +1,11 @@
 /*
  * ui_st7789.c
  * Giao dien "Vinyl Player - Now Playing" (Warm Retro Analog Aesthetics)
- * tren man hinh ST7789 240x240 su dung driver goc esp_lcd (SPI DMA):
- *   - Hien thi dia chi IP ngay goc trai man hinh (Y: 0..15) sau khi ket noi WiFi
+ * Ho tro 2 Mode Man hinh LED / TFT qua driver goc esp_lcd (SPI DMA):
+ *   - MODE 0: ST7789 1.54" (240x240, 27MHz, CS=GPIO5/None, IPS INVON)
+ *   - MODE 1: ST7735 1.8"  (128x160 hoac 160x128, 20MHz, CS=GPIO15, Offset 2,1)
+ * Tinh nang:
+ *   - Hien thi dia chi IP ngay goc trai man hinh sau khi ket noi WiFi
  *   - Nen kem giay am (#F4F1EA), Dia than Den Tuyen (#000000) + Bong do Ellipse (#D4CFC4)
  *   - Nhan tam Do Gach Terracotta (#C24B38) + Can kim Vang Dong thang (#C0A266)
  *   - Dirty-Rectangle Direct Render qua esp_lcd_panel_draw_bitmap()
@@ -19,12 +22,13 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_attr.h"
+#include "esp32/rom/tjpgd.h"
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
 
 /* =========================================================================
- * Macro chuyen doi RGB888 sang RGB565 Big-Endian (chuan SPI ST7789 DMA)
+ * Macro chuyen doi RGB888 sang RGB565 Big-Endian (chuan SPI ST7789/ST7735 DMA)
  * Tinh toan hoan toan tai compile-time (Zero runtime byte-swap overhead)
  * ========================================================================= */
 #define RAW_RGB565(r, g, b) \
@@ -55,38 +59,155 @@
 #define COL_TONEARM_GOLD     BE_RGB565(192, 162, 102)  /* #C0A266 Can kim vang dong (Brass/Gold) */
 #define COL_TONEARM_EDGE     BE_RGB565(156, 128, 72)   /* #9C8048 Vien chot xoay can kim */
 
-#define COL_TEXT_DARK        BE_RGB565(28,  28,  28)   /* #1C1C1C Chu tieu de dam & icon */
-#define COL_TEXT_MUTED       BE_RGB565(132, 126, 118)  /* #847E76 Chu phu xam am */
+#define COL_TEXT_DARK        0x0000U                   /* #000000 Chu tieu de & icon den sac net */
+#define COL_TEXT_MUTED       BE_RGB565(96,  90,  82)   /* #605A52 Chu phu xam dam ro net */
 #define COL_SLIDER_TRACK     BE_RGB565(208, 203, 194)  /* #D0CBC2 Thanh tien trinh xam nhat */
 #define COL_BTN_CIRCLE       BE_RGB565(228, 224, 215)  /* #E4E0D7 Nen tron nut Prev/Next */
 #define COL_WIFI_ONLINE      BE_RGB565(46,  148, 74)   /* #2E944A Cham xanh ket noi WiFi */
 #define COL_PURE_WHITE       0xFFFFU                   /* #FFFFFF Tam giac Play / Pause trang */
 
 /* =========================================================================
- * Kich thuoc 5 vung Dirty-Rectangle khong chong lan tren man hinh 240x240
+ * Cau truc Layout Dirty-Rectangle tu dong thich ung ST7789 (240x240) & ST7735 (128x160)
  * ========================================================================= */
-#define TOP_IP_BAR_Y         0       /* Y: 0..15 (16 px: Dia chi IP goc trai khi co WiFi) */
-#define TOP_IP_BAR_H         16
+typedef struct {
+    uint8_t  mode;
+    int16_t  width;
+    int16_t  height;
+    int16_t  top_ip_y;
+    int16_t  top_ip_h;
+    int16_t  vinyl_x;
+    int16_t  vinyl_y;
+    int16_t  vinyl_w;
+    int16_t  vinyl_h;
+    int16_t  vinyl_strip_h;
+    int16_t  vinyl_cx;
+    int16_t  vinyl_cy;
+    int16_t  vinyl_outer_r;
+    int16_t  vinyl_label_r;
+    int16_t  vinyl_hole_r;
+    int16_t  shadow_y;
+    int16_t  shadow_a;
+    int16_t  shadow_b;
+    int16_t  pivot_x;
+    int16_t  pivot_y;
+    int16_t  tip_play_x;
+    int16_t  tip_play_y;
+    int16_t  tip_pause_x;
+    int16_t  tip_pause_y;
+    int16_t  title_y;
+    int16_t  title_h;
+    uint8_t  title_scale;
+    int16_t  slider_y;
+    int16_t  slider_h;
+    int16_t  bottom_y;
+    int16_t  bottom_h;
+} lcd_ui_layout_t;
 
-#define VINYL_W              148
-#define VINYL_H              132
-#define VINYL_STRIP_H        33      /* 132 / 4 = 33 dong moi strip DMA */
-#define VINYL_SCREEN_X       46      /* (240 - 148) / 2 = 46 */
-#define VINYL_SCREEN_Y       16      /* Y: 16..147 */
-#define VINYL_CX             74      /* Tam X trong vung 148x132 (Man hinh X = 120) */
-#define VINYL_CY             58      /* Tam Y trong vung 148x132 (Man hinh Y = 74) */
-#define VINYL_OUTER_R        54      /* Duong kinh dia than = 108 px */
-#define VINYL_LABEL_R        21      /* Duong kinh nhan tam = 42 px */
-#define VINYL_HOLE_R         3       /* Lo truc den o giua */
+static lcd_ui_layout_t s_ui;
 
-#define TITLE_BAR_Y          148     /* Y: 148..179 (32 px: Title + Subtitle) */
-#define TITLE_BAR_H          32
+static void configure_ui_layout(uint8_t mode)
+{
+    if (mode == LCD_MODE_ST7735_128X160) {
+        s_ui.mode          = LCD_MODE_ST7735_128X160;
+        s_ui.width         = LCD_H_RES;
+        s_ui.height        = LCD_V_RES;
 
-#define SLIDER_BAR_Y         180     /* Y: 180..199 (20 px: Thanh tien trinh + Time/Vol) */
-#define SLIDER_BAR_H         20
-
-#define BOTTOM_BAR_Y         200     /* Y: 200..239 (40 px: 5 nut dieu khien tron) */
-#define BOTTOM_BAR_H         40
+        if (LCD_H_RES <= LCD_V_RES) {
+            /* ST7735 Portrait 128x160: 5 vung Dirty-Rectangle khop khit 160 dong */
+            s_ui.top_ip_y      = 0;
+            s_ui.top_ip_h      = 12;  /* Y: 0..11 */
+            s_ui.vinyl_w       = 116;
+            s_ui.vinyl_h       = 88;  /* Y: 12..99 (4 strip x 22 dong) */
+            s_ui.vinyl_strip_h = 22;
+            s_ui.vinyl_x       = (LCD_H_RES - 116) / 2; /* 6 */
+            s_ui.vinyl_y       = 12;
+            s_ui.vinyl_cx      = 58;  /* Tam X tren man hinh = 64 */
+            s_ui.vinyl_cy      = 40;
+            s_ui.vinyl_outer_r = 38;  /* Duong kinh dia = 76 px (to, ro net) */
+            s_ui.vinyl_label_r = 14;  /* Duong kinh nhan = 28 px */
+            s_ui.vinyl_hole_r  = 2;
+            s_ui.shadow_y      = 82;
+            s_ui.shadow_a      = 35;
+            s_ui.shadow_b      = 3;
+            s_ui.pivot_x       = 98;
+            s_ui.pivot_y       = 6;
+            s_ui.tip_play_x    = 72;
+            s_ui.tip_play_y    = 33;
+            s_ui.tip_pause_x   = 93;
+            s_ui.tip_pause_y   = 37;
+            s_ui.title_y       = 100; /* Y: 100..121 (22 px) */
+            s_ui.title_h       = 22;
+            s_ui.title_scale   = 1;
+            s_ui.slider_y      = 122; /* Y: 122..136 (15 px) */
+            s_ui.slider_h      = 15;
+            s_ui.bottom_y      = 137; /* Y: 137..159 (23 px) */
+            s_ui.bottom_h      = 23;
+        } else {
+            /* ST7735 Landscape 160x128: 5 vung Dirty-Rectangle khop khit 128 dong */
+            s_ui.top_ip_y      = 0;
+            s_ui.top_ip_h      = 10;  /* Y: 0..9 */
+            s_ui.vinyl_w       = 96;
+            s_ui.vinyl_h       = 64;  /* Y: 10..73 (4 strip x 16 dong) */
+            s_ui.vinyl_strip_h = 16;
+            s_ui.vinyl_x       = (LCD_H_RES - 96) / 2; /* 32 */
+            s_ui.vinyl_y       = 10;
+            s_ui.vinyl_cx      = 48;
+            s_ui.vinyl_cy      = 29;
+            s_ui.vinyl_outer_r = 26;
+            s_ui.vinyl_label_r = 10;
+            s_ui.vinyl_hole_r  = 2;
+            s_ui.shadow_y      = 58;
+            s_ui.shadow_a      = 25;
+            s_ui.shadow_b      = 3;
+            s_ui.pivot_x       = 78;
+            s_ui.pivot_y       = 5;
+            s_ui.tip_play_x    = 58;
+            s_ui.tip_play_y    = 24;
+            s_ui.tip_pause_x   = 74;
+            s_ui.tip_pause_y   = 27;
+            s_ui.title_y       = 74;  /* Y: 74..93 (20 px) */
+            s_ui.title_h       = 20;
+            s_ui.title_scale   = 1;
+            s_ui.slider_y      = 94;  /* Y: 94..107 (14 px) */
+            s_ui.slider_h      = 14;
+            s_ui.bottom_y      = 108; /* Y: 108..127 (20 px) */
+            s_ui.bottom_h      = 20;
+        }
+    } else {
+        /* ST7789 240x240: Layout goc 5 vung Dirty-Rectangle khop khit 240 dong */
+        s_ui.mode          = LCD_MODE_ST7789_240X240;
+        s_ui.width         = 240;
+        s_ui.height        = 240;
+        s_ui.top_ip_y      = 0;
+        s_ui.top_ip_h      = 16;  /* Y: 0..15 */
+        s_ui.vinyl_w       = 148;
+        s_ui.vinyl_h       = 132; /* Y: 16..147 (4 strip x 33 dong) */
+        s_ui.vinyl_strip_h = 33;
+        s_ui.vinyl_x       = 46;
+        s_ui.vinyl_y       = 16;
+        s_ui.vinyl_cx      = 74;
+        s_ui.vinyl_cy      = 58;
+        s_ui.vinyl_outer_r = 54;
+        s_ui.vinyl_label_r = 21;
+        s_ui.vinyl_hole_r  = 3;
+        s_ui.shadow_y      = 120;
+        s_ui.shadow_a      = 51;
+        s_ui.shadow_b      = 5;
+        s_ui.pivot_x       = 124;
+        s_ui.pivot_y       = 9;
+        s_ui.tip_play_x    = 90;
+        s_ui.tip_play_y    = 46;
+        s_ui.tip_pause_x   = 118;
+        s_ui.tip_pause_y   = 52;
+        s_ui.title_y       = 148; /* Y: 148..179 (32 px) */
+        s_ui.title_h       = 32;
+        s_ui.title_scale   = 2;
+        s_ui.slider_y      = 180; /* Y: 180..199 (20 px) */
+        s_ui.slider_h      = 20;
+        s_ui.bottom_y      = 200; /* Y: 200..239 (40 px) */
+        s_ui.bottom_h      = 40;
+    }
+}
 
 /* =========================================================================
  * Bang tra cuu Luong giac Fixed-Point (Scale = 1024 = 1 << 10) luu trong Flash
@@ -186,15 +307,18 @@ static const uint8_t kFont5x7[95][5] = {
 /* =========================================================================
  * Bo dem DMA tinh cho Dirty-Rectangle Rendering (Zero Runtime Malloc)
  * Dung chung 1 bo dem DMA 19.2 KB cho tat ca cac vung Dirty-Rectangle
- * (tiet kiem 10 KB SRAM noi cho lwIP TCP sockets & Web Server)
+ * tren ca ST7789 (240x240) lan ST7735 (128x160 / 160x128)
  * ========================================================================= */
-static DMA_ATTR uint16_t s_bar_buf[TFT_WIDTH * BOTTOM_BAR_H];         /* 240x40 = 19,200 B */
-#define s_vinyl_strip_buf s_bar_buf                                   /* 148x33 =  9,768 B */
+static DMA_ATTR uint16_t s_bar_buf[TFT_MAX_WIDTH * 40];               /* 240x40 = 19,200 B */
+#define s_vinyl_strip_buf s_bar_buf
 
 static esp_lcd_panel_io_handle_t s_io_handle    = NULL;
 static esp_lcd_panel_handle_t    s_panel_handle = NULL;
 static SemaphoreHandle_t         s_dma_sem      = NULL;
 static StaticSemaphore_t         s_dma_sem_storage;
+static SemaphoreHandle_t         s_lcd_mutex    = NULL;
+static StaticSemaphore_t         s_lcd_mutex_storage;
+static volatile int64_t          s_last_video_frame_us = 0;
 
 /* Callback IRAM_ATTR duoc esp_lcd goi ngay khi SPI DMA truyen xong 1 Dirty-Rectangle */
 static bool IRAM_ATTR on_lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
@@ -347,29 +471,29 @@ static void buf_draw_text(uint16_t *buf, int16_t bw, int16_t bh,
 }
 
 /* =========================================================================
- * 1. DIRTY-RECTANGLE: TOP-LEFT WIFI IP ADDRESS (Y: 0..15)
+ * 1. DIRTY-RECTANGLE: TOP-LEFT WIFI IP ADDRESS
  * Hien thi dia chi IP ngay goc trai man hinh sau khi da ket noi duoc WiFi
  * ========================================================================= */
 static void render_top_ip_dirty_rect(bool wifi_ok, const char *ip_str)
 {
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, TOP_IP_BAR_H, 0, 0, TFT_WIDTH, TOP_IP_BAR_H, COL_BG_CREAM);
+    int16_t w = s_ui.width;
+    int16_t h = s_ui.top_ip_h;
+    buf_fill_rect(s_bar_buf, w, h, 0, 0, w, h, COL_BG_CREAM);
 
     if (wifi_ok && ip_str != NULL && ip_str[0] != '\0') {
-        /* Cham tron xanh bao ket noi WiFi + Dia chi IP ngay goc trai (X=6, Y=4) */
-        buf_fill_circle(s_bar_buf, TFT_WIDTH, TOP_IP_BAR_H, 8, 7, 2, COL_WIFI_ONLINE);
-        buf_draw_text(s_bar_buf, TFT_WIDTH, TOP_IP_BAR_H, ip_str, 14, 4, 1, COL_TEXT_DARK);
+        int16_t dot_y  = h / 2;
+        int16_t text_y = (h - 7) / 2;
+        if (text_y < 1) text_y = 1;
+        buf_fill_circle(s_bar_buf, w, h, 6, dot_y, 2, COL_WIFI_ONLINE);
+        buf_draw_text(s_bar_buf, w, h, ip_str, 11, text_y, 1, COL_TEXT_DARK);
     }
 
-    lcd_draw_bitmap_dma_sync(0, TOP_IP_BAR_Y, TFT_WIDTH, TOP_IP_BAR_Y + TOP_IP_BAR_H, s_bar_buf);
+    lcd_draw_bitmap_dma_sync(0, s_ui.top_ip_y, w, s_ui.top_ip_y + h, s_bar_buf);
 }
 
 /* =========================================================================
- * 2. DIRTY-RECTANGLE: PITCH-BLACK VINYL + SHADOW + GOLD TONEARM (Y: 16..147)
- * Thiet ke giong het anh mau "Vinyl Player - Now Playing":
- *   - Nen kem #F4F1EA + Bong do ellipse mem #D4CFC4 duoi day dia
- *   - Dia than Den Tuyen (#000000) voi 6 vong ranh dong tam sac net
- *   - Nhan tam Do Gach Terracotta (#C24B38), vong kem trong & chu "SLOW RIVER" xoay
- *   - Can kim Vang Dong thang (#C0A266) voi chot tron goc tren phai
+ * 2. DIRTY-RECTANGLE: PITCH-BLACK VINYL + SHADOW + GOLD TONEARM
+ * Tu dong co gian ty le chuan xac giua ST7789 (240x240) va ST7735 (128x160)
  * ========================================================================= */
 static void render_vinyl_dirty_rect(uint16_t angle_deg, bool is_playing)
 {
@@ -377,48 +501,54 @@ static void render_vinyl_dirty_rect(uint16_t angle_deg, bool is_playing)
     int32_t cos_a = cos_lut[deg];
     int32_t sin_a = sin_lut[deg];
 
-    const int16_t cx = VINYL_CX; /* 74 */
-    const int16_t cy = VINYL_CY; /* 58 */
+    const int16_t vw      = s_ui.vinyl_w;
+    const int16_t strip_h = s_ui.vinyl_strip_h;
+    const int16_t cx      = s_ui.vinyl_cx;
+    const int16_t cy      = s_ui.vinyl_cy;
+    const int16_t ro      = s_ui.vinyl_outer_r;
+    const int16_t rl      = s_ui.vinyl_label_r;
+    const int16_t rh      = s_ui.vinyl_hole_r;
 
-    const int32_t r_vinyl_outer_sq = VINYL_OUTER_R * VINYL_OUTER_R;               /* 54^2 = 2916 */
-    const int32_t r_vinyl_rim_sq   = (VINYL_OUTER_R - 2) * (VINYL_OUTER_R - 2);   /* 52^2 = 2704 */
-    const int32_t r_label_outer_sq = VINYL_LABEL_R * VINYL_LABEL_R;               /* 21^2 =  441 */
-    const int32_t r_label_ring1_sq = (VINYL_LABEL_R - 3) * (VINYL_LABEL_R - 3);   /* 18^2 =  324 */
-    const int32_t r_label_ring2_sq = (VINYL_LABEL_R - 4) * (VINYL_LABEL_R - 4);   /* 17^2 =  289 */
-    const int32_t r_hole_sq        = VINYL_HOLE_R * VINYL_HOLE_R;                 /*  3^2 =    9 */
+    const int32_t r_vinyl_outer_sq = (int32_t)ro * ro;
+    const int32_t r_vinyl_rim_sq   = (int32_t)(ro - 2) * (ro - 2);
+    const int32_t r_label_outer_sq = (int32_t)rl * rl;
+    const int32_t r_label_ring1_sq = (int32_t)(rl - 2) * (rl - 2);
+    const int32_t r_label_ring2_sq = (int32_t)(rl - 3) * (rl - 3);
+    const int32_t r_hole_sq        = (int32_t)rh * rh;
 
-    /* Toa do bong do Ellipse nam ngay duoi dia than (sy = 120, a = 51, b = 5) */
-    const int16_t shadow_y  = 120;
-    const int32_t shadow_a2 = 51 * 51; /* 2601 */
-    const int32_t shadow_b2 = 5 * 5;   /*   25 */
-    const int32_t shadow_core_lim = shadow_a2 * shadow_b2;        /* 65,025 */
-    const int32_t shadow_soft_lim = shadow_core_lim + 18000;      /* 83,025 */
+    /* Toa do bong do Ellipse nam ngay duoi dia than */
+    const int16_t shadow_y  = s_ui.shadow_y;
+    const int32_t shadow_a2 = (int32_t)s_ui.shadow_a * s_ui.shadow_a;
+    const int32_t shadow_b2 = (int32_t)s_ui.shadow_b * s_ui.shadow_b;
+    const int32_t shadow_core_lim = shadow_a2 * shadow_b2;
+    const int32_t shadow_soft_lim = shadow_core_lim + (shadow_core_lim / 3);
 
     /* Toa do Can kim Vang Dong thang (Straight Gold Tonearm) o goc tren phai */
-    const int16_t pivot_x = 124;
-    const int16_t pivot_y = 9;
-    const int16_t tip_x   = is_playing ? 90 : 118;
-    const int16_t tip_y   = is_playing ? 46 : 52;
+    const int16_t pivot_x = s_ui.pivot_x;
+    const int16_t pivot_y = s_ui.pivot_y;
+    const int16_t tip_x   = is_playing ? s_ui.tip_play_x : s_ui.tip_pause_x;
+    const int16_t tip_y   = is_playing ? s_ui.tip_play_y : s_ui.tip_pause_y;
+    const int16_t pivot_r = (s_ui.mode == LCD_MODE_ST7735_128X160) ? 3 : 5;
 
-    /* Render 148x132 theo 4 strip 148x33 qua SPI DMA */
+    /* Render theo 4 strip ngang qua SPI DMA */
     for (int16_t strip = 0; strip < 4; strip++) {
-        int16_t y0 = strip * VINYL_STRIP_H;
+        int16_t y0 = strip * strip_h;
 
-        for (int16_t sy = 0; sy < VINYL_STRIP_H; sy++) {
+        for (int16_t sy = 0; sy < strip_h; sy++) {
             int16_t y   = y0 + sy;
             int32_t dy  = y - cy;
             int32_t dy2 = dy * dy;
             int32_t sdy = y - shadow_y;
             int32_t sdy_term = (sdy * sdy) * shadow_a2;
-            uint16_t *line = &s_vinyl_strip_buf[sy * VINYL_W];
+            uint16_t *line = &s_vinyl_strip_buf[sy * vw];
 
-            for (int16_t x = 0; x < VINYL_W; x++) {
+            for (int16_t x = 0; x < vw; x++) {
                 int32_t dx = x - cx;
                 int32_t d2 = dx * dx + dy2;
 
                 if (d2 > r_vinyl_outer_sq) {
                     /* Ngoai dia than: Kiem tra vung bong do Ellipse phia duoi */
-                    if (y >= 112 && y <= 128) {
+                    if (sdy >= -(s_ui.shadow_b + 2) && sdy <= (s_ui.shadow_b + 2)) {
                         int32_t ell = (dx * dx) * shadow_b2 + sdy_term;
                         if (ell <= shadow_core_lim) {
                             line[x] = COL_SHADOW_CORE;
@@ -431,87 +561,110 @@ static void render_vinyl_dirty_rect(uint16_t angle_deg, bool is_playing)
                         line[x] = COL_BG_CREAM;
                     }
                 } else if (d2 > r_vinyl_rim_sq) {
-                    /* Vien ngoai dia than */
                     line[x] = COL_VINYL_RIM;
                 } else if (d2 <= r_hole_sq) {
-                    /* Lo truc giua mau den tuyen */
                     line[x] = COL_SPINDLE_BLACK;
                 } else if (d2 <= r_label_outer_sq) {
-                    /* Nhan tam Terracotta (#C24B38) voi vong chi kem & chu xoay */
-                    if (d2 >= r_label_ring2_sq && d2 <= r_label_ring1_sq) {
+                    /* Nhan tam Terracotta (#C24B38) voi vong chi kem & vach xoay muot */
+                    if (s_ui.mode == LCD_MODE_ST7735_128X160) {
+                        int32_t rx_fp = (dx * cos_a + dy * sin_a) >> 10;
+                        int32_t ry_fp = (-dx * sin_a + dy * cos_a) >> 10;
+                        if (d2 > r_label_outer_sq - 28) {
+                            line[x] = COL_LABEL_DARK;
+                        } else if (d2 >= 10 * 10 - 10 && d2 <= 10 * 10 + 10) {
+                            /* Vong tron lien mach R=10 + cung sang xoay theo dia (Zero pixel snow) */
+                            line[x] = (rx_fp > 0 && ry_fp < 0) ? COL_PURE_WHITE : COL_LABEL_RING;
+                        } else if (ry_fp >= -5 && ry_fp <= -4 && i32_abs(rx_fp) <= 6) {
+                            line[x] = COL_LABEL_TEXT;
+                        } else {
+                            line[x] = COL_LABEL_TERRA;
+                        }
+                    } else if (d2 >= r_label_ring2_sq && d2 <= r_label_ring1_sq) {
                         line[x] = COL_LABEL_RING;
-                    } else if (d2 > r_label_outer_sq - 32) {
+                    } else if (d2 > r_label_outer_sq - (rl * 2)) {
                         line[x] = COL_LABEL_DARK;
                     } else {
                         int32_t rx_fp = (dx * cos_a + dy * sin_a) >> 10;
                         int32_t ry_fp = (-dx * sin_a + dy * cos_a) >> 10;
                         int32_t abs_rx = i32_abs(rx_fp);
+                        int16_t txt_lim = (rl > 15) ? 11 : 7;
 
-                        /* Dong chu lon "SLOW RIVER" phia tren lo truc (xoay theo dia) */
-                        if (ry_fp >= -9 && ry_fp <= -6 && abs_rx <= 11) {
+                        if (ry_fp >= -6 && ry_fp <= -4 && abs_rx <= txt_lim) {
                             line[x] = (((rx_fp + 16) & 3) != 0) ? COL_LABEL_TEXT : COL_LABEL_TERRA;
-                        }
-                        /* 2 dong chu nho "June Halberd" / "SIDE A . 33 RPM" phia duoi lo truc */
-                        else if (ry_fp == 6 && abs_rx <= 8 && ((rx_fp + 12) & 3) != 0) {
-                            line[x] = COL_LABEL_RING;
-                        } else if (ry_fp == 9 && abs_rx <= 9 && abs_rx != 1) {
+                        } else if (ry_fp == 5 && abs_rx <= (txt_lim - 2) && ((rx_fp + 12) & 3) != 0) {
                             line[x] = COL_LABEL_RING;
                         } else {
                             line[x] = COL_LABEL_TERRA;
                         }
                     }
                 } else {
-                    /* Mat dia than DEN TUYEN (#000000) + 6 vong ranh dong tam sac net */
+                    /* Mat dia than DEN TUYEN (#000000) + cac vong ranh dong tam lien mach (R*R +- R) */
                     int32_t rx_fp = (dx * cos_a + dy * sin_a) >> 10;
                     int32_t ry_fp = (-dx * sin_a + dy * cos_a) >> 10;
                     int32_t abs_rx = i32_abs(rx_fp);
                     int32_t abs_ry = i32_abs(ry_fp);
 
-                    bool in_spec_core = (abs_ry * 100 < abs_rx * 12);
-                    bool in_spec_soft = (abs_ry * 100 < abs_rx * 25);
+                    bool in_spec_core = (abs_ry * 100 < abs_rx * 14);
+                    bool in_spec_soft = (abs_ry * 100 < abs_rx * 28);
 
-                    bool is_groove = (d2 >= 25 * 25 - 18 && d2 <= 25 * 25 + 18) ||
-                                     (d2 >= 30 * 30 - 22 && d2 <= 30 * 30 + 22) ||
-                                     (d2 >= 35 * 35 - 26 && d2 <= 35 * 35 + 26) ||
-                                     (d2 >= 40 * 40 - 30 && d2 <= 40 * 40 + 30) ||
-                                     (d2 >= 45 * 45 - 34 && d2 <= 45 * 45 + 34) ||
-                                     (d2 >= 49 * 49 - 38 && d2 <= 49 * 49 + 38);
+                    bool is_groove;
+                    if (s_ui.mode == LCD_MODE_ST7735_128X160) {
+                        is_groove = (d2 >= 20 * 20 - 20 && d2 <= 20 * 20 + 20) ||
+                                    (d2 >= 26 * 26 - 26 && d2 <= 26 * 26 + 26) ||
+                                    (d2 >= 32 * 32 - 32 && d2 <= 32 * 32 + 32);
+                    } else {
+                        is_groove = (d2 >= 25 * 25 - 25 && d2 <= 25 * 25 + 25) ||
+                                    (d2 >= 30 * 30 - 30 && d2 <= 30 * 30 + 30) ||
+                                    (d2 >= 35 * 35 - 35 && d2 <= 35 * 35 + 35) ||
+                                    (d2 >= 40 * 40 - 40 && d2 <= 40 * 40 + 40) ||
+                                    (d2 >= 45 * 45 - 45 && d2 <= 45 * 45 + 45) ||
+                                    (d2 >= 49 * 49 - 49 && d2 <= 49 * 49 + 49);
+                    }
 
                     if (is_groove) {
                         if (in_spec_core)      line[x] = COL_GROOVE_GLINT2;
                         else if (in_spec_soft) line[x] = COL_GROOVE_GLINT1;
                         else                   line[x] = COL_VINYL_GROOVE;
                     } else {
-                        if (in_spec_core)      line[x] = COL_VINYL_SHEEN;
-                        else                   line[x] = COL_VINYL_BLACK;
+                        if (s_ui.mode != LCD_MODE_ST7735_128X160 && in_spec_core) {
+                            line[x] = COL_VINYL_SHEEN;
+                        } else {
+                            line[x] = COL_VINYL_BLACK;
+                        }
                     }
                 }
             }
         }
 
         /* Ve Can kim Vang Dong thang (Straight Gold Tonearm) + Chot xoay tron */
-        buf_draw_wide_line_strip(s_vinyl_strip_buf, VINYL_W, y0, VINYL_STRIP_H,
-                                 pivot_x, pivot_y, tip_x, tip_y, 1, COL_TONEARM_GOLD);
-        buf_draw_wide_line_strip(s_vinyl_strip_buf, VINYL_W, y0, VINYL_STRIP_H,
-                                 pivot_x, pivot_y, pivot_x, pivot_y, 5, COL_TONEARM_EDGE);
-        buf_draw_wide_line_strip(s_vinyl_strip_buf, VINYL_W, y0, VINYL_STRIP_H,
-                                 pivot_x, pivot_y, pivot_x, pivot_y, 4, COL_TONEARM_GOLD);
+        if (s_ui.mode == LCD_MODE_ST7735_128X160) {
+            buf_draw_wide_line_strip(s_vinyl_strip_buf, vw, y0, strip_h,
+                                     pivot_x + 2, pivot_y, tip_x + 2, tip_y, 0, COL_TONEARM_EDGE);
+            buf_draw_wide_line_strip(s_vinyl_strip_buf, vw, y0, strip_h,
+                                     pivot_x, pivot_y, tip_x, tip_y, 0, COL_TONEARM_GOLD);
+            buf_draw_wide_line_strip(s_vinyl_strip_buf, vw, y0, strip_h,
+                                     pivot_x + 1, pivot_y, tip_x + 1, tip_y, 0, COL_TONEARM_GOLD);
+        } else {
+            buf_draw_wide_line_strip(s_vinyl_strip_buf, vw, y0, strip_h,
+                                     pivot_x, pivot_y, tip_x, tip_y, 1, COL_TONEARM_GOLD);
+        }
+        buf_draw_wide_line_strip(s_vinyl_strip_buf, vw, y0, strip_h,
+                                 pivot_x, pivot_y, pivot_x, pivot_y, pivot_r, COL_TONEARM_EDGE);
+        buf_draw_wide_line_strip(s_vinyl_strip_buf, vw, y0, strip_h,
+                                 pivot_x, pivot_y, pivot_x, pivot_y, pivot_r - 1, COL_TONEARM_GOLD);
 
-        /* Day strip Dirty-Rectangle qua esp_lcd_panel_draw_bitmap */
         lcd_draw_bitmap_dma_sync(
-            VINYL_SCREEN_X,
-            VINYL_SCREEN_Y + y0,
-            VINYL_SCREEN_X + VINYL_W,
-            VINYL_SCREEN_Y + y0 + VINYL_STRIP_H,
+            s_ui.vinyl_x,
+            s_ui.vinyl_y + y0,
+            s_ui.vinyl_x + vw,
+            s_ui.vinyl_y + y0 + strip_h,
             s_vinyl_strip_buf
         );
     }
 }
 
 /* =========================================================================
- * 3. DIRTY-RECTANGLE: SONG TITLE & SUBTITLE (Y: 148..179)
- *   - Dong 1 (Scale 2 Bold #1C1C1C): Ten bai hat ("Slow River"), tu dong Marquee 1px neu dai
- *   - Dong 2 (Scale 1 Muted #847E76): Ten kenh & Nghe si ("Coastal Letters . June Halberd")
+ * 3. DIRTY-RECTANGLE: SONG TITLE & SUBTITLE
  * ========================================================================= */
 static void split_artist_and_song(const char *raw_title, const char *station_name,
                                   char *out_song, size_t song_sz,
@@ -545,64 +698,75 @@ static void render_title_dirty_rect(const char *station_name, const char *raw_ti
     char sub_str[64];
     split_artist_and_song(raw_title, station_name, song_str, sizeof(song_str), sub_str, sizeof(sub_str));
 
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, 0, 0, TFT_WIDTH, TITLE_BAR_H, COL_BG_CREAM);
+    const int16_t w  = s_ui.width;
+    const int16_t h  = s_ui.title_h;
+    const uint8_t sc = s_ui.title_scale;
 
-    /* Dong 1: Ten bai hat in dam (Scale = 2, mau #1C1C1C) */
-    int16_t tw = text_pixel_width(song_str, 2) + 1;
+    buf_fill_rect(s_bar_buf, w, h, 0, 0, w, h, COL_BG_CREAM);
+
+    int16_t tw = text_pixel_width(song_str, sc) + ((sc > 1) ? 1 : 0);
     if (out_song_width != NULL) {
         *out_song_width = tw;
     }
 
-    int16_t max_visible_w = TFT_WIDTH - 24; /* 216 px */
-    int16_t title_y = 2;
+    int16_t margin_px     = (s_ui.mode == LCD_MODE_ST7735_128X160) ? 6 : 12;
+    int16_t max_visible_w = w - (margin_px * 2);
+    int16_t title_y       = 2;
+    int16_t sub_y         = (sc == 2) ? 21 : (h - 9);
 
     if (tw <= max_visible_w) {
-        int16_t tx = (TFT_WIDTH - tw) / 2;
-        buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, song_str, tx,     title_y, 2, COL_TEXT_DARK);
-        buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, song_str, tx + 1, title_y, 2, COL_TEXT_DARK);
+        int16_t tx = (w - tw) / 2;
+        buf_draw_text(s_bar_buf, w, h, song_str, tx, title_y, sc, COL_TEXT_DARK);
+        if (sc > 1) {
+            buf_draw_text(s_bar_buf, w, h, song_str, tx + 1, title_y, sc, COL_TEXT_DARK);
+        }
     } else {
-        int16_t start_x = 12 - marquee_offset_px;
-        buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, song_str, start_x,     title_y, 2, COL_TEXT_DARK);
-        buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, song_str, start_x + 1, title_y, 2, COL_TEXT_DARK);
-
-        const int16_t gap_px = 48;
-        int16_t second_x = start_x + tw + gap_px;
-        if (second_x < TFT_WIDTH - 12) {
-            buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, " . ", start_x + tw + 8, title_y, 2, COL_LABEL_TERRA);
-            buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, song_str, second_x,     title_y, 2, COL_TEXT_DARK);
-            buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, song_str, second_x + 1, title_y, 2, COL_TEXT_DARK);
+        int16_t start_x = margin_px - marquee_offset_px;
+        buf_draw_text(s_bar_buf, w, h, song_str, start_x, title_y, sc, COL_TEXT_DARK);
+        if (sc > 1) {
+            buf_draw_text(s_bar_buf, w, h, song_str, start_x + 1, title_y, sc, COL_TEXT_DARK);
         }
 
-        /* Le kem 2 ben khi cuon chu Marquee */
-        buf_fill_rect(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, 0, 0, 10, 18, COL_BG_CREAM);
-        buf_fill_rect(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, TFT_WIDTH - 10, 0, 10, 18, COL_BG_CREAM);
+        const int16_t gap_px = 36;
+        int16_t second_x = start_x + tw + gap_px;
+        if (second_x < w - margin_px) {
+            buf_draw_text(s_bar_buf, w, h, " . ", start_x + tw + 6, title_y, sc, COL_LABEL_TERRA);
+            buf_draw_text(s_bar_buf, w, h, song_str, second_x, title_y, sc, COL_TEXT_DARK);
+            if (sc > 1) {
+                buf_draw_text(s_bar_buf, w, h, song_str, second_x + 1, title_y, sc, COL_TEXT_DARK);
+            }
+        }
+
+        buf_fill_rect(s_bar_buf, w, h, 0, 0, margin_px - 1, 8 * sc, COL_BG_CREAM);
+        buf_fill_rect(s_bar_buf, w, h, w - (margin_px - 1), 0, margin_px - 1, 8 * sc, COL_BG_CREAM);
     }
 
-    /* Dong 2: Subtitle "Coastal Letters . June Halberd" (Scale = 1, mau xam am #847E76) */
     int16_t sub_w = text_pixel_width(sub_str, 1);
-    int16_t sub_x = (TFT_WIDTH - sub_w) / 2;
-    if (sub_x < 6) sub_x = 6;
-    buf_draw_text(s_bar_buf, TFT_WIDTH, TITLE_BAR_H, sub_str, sub_x, 21, 1, COL_TEXT_MUTED);
+    int16_t sub_x = (w - sub_w) / 2;
+    if (sub_x < 4) sub_x = 4;
+    buf_draw_text(s_bar_buf, w, h, sub_str, sub_x, sub_y, 1, COL_TEXT_MUTED);
 
-    lcd_draw_bitmap_dma_sync(0, TITLE_BAR_Y, TFT_WIDTH, TITLE_BAR_Y + TITLE_BAR_H, s_bar_buf);
+    lcd_draw_bitmap_dma_sync(0, s_ui.title_y, w, s_ui.title_y + h, s_bar_buf);
 }
 
 /* =========================================================================
- * 4. DIRTY-RECTANGLE: MINIMALIST PROGRESS / VOLUME LINE (Y: 180..199)
- *   - Thanh ngang manh (#D0CBC2) + Phan da phat mau Do Terracotta (#C24B38)
- *   - Nut tron Terracotta (r = 4px) + Chi so thoi gian "0:09" va "-3:28" / "VOL"
+ * 4. DIRTY-RECTANGLE: MINIMALIST PROGRESS / VOLUME LINE
  * ========================================================================= */
 static void render_slider_dirty_rect(uint32_t elapsed_sec, uint8_t volume_pct, bool show_vol_label)
 {
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, SLIDER_BAR_H, 0, 0, TFT_WIDTH, SLIDER_BAR_H, COL_BG_CREAM);
+    const int16_t w = s_ui.width;
+    const int16_t h = s_ui.slider_h;
+    buf_fill_rect(s_bar_buf, w, h, 0, 0, w, h, COL_BG_CREAM);
 
-    const int16_t bar_x0 = 18;
-    const int16_t bar_x1 = TFT_WIDTH - 18; /* 222 */
-    const int16_t bar_w  = bar_x1 - bar_x0; /* 204 */
-    const int16_t bar_y  = 5;
+    const int16_t pad    = (s_ui.mode == LCD_MODE_ST7735_128X160) ? 8 : 18;
+    const int16_t bar_x0 = pad;
+    const int16_t bar_x1 = w - pad;
+    const int16_t bar_w  = bar_x1 - bar_x0;
+    const int16_t bar_y  = (s_ui.mode == LCD_MODE_ST7735_128X160) ? 3 : 5;
+    const int16_t knob_r = (s_ui.mode == LCD_MODE_ST7735_128X160) ? 3 : 4;
+    const int16_t txt_y  = h - 8;
 
-    /* Thanh nen xam nhat 2px */
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, SLIDER_BAR_H, bar_x0, bar_y, bar_w, 2, COL_SLIDER_TRACK);
+    buf_fill_rect(s_bar_buf, w, h, bar_x0, bar_y, bar_w, 2, COL_SLIDER_TRACK);
 
     int16_t knob_offset;
     if (show_vol_label) {
@@ -611,20 +775,18 @@ static void render_slider_dirty_rect(uint32_t elapsed_sec, uint8_t volume_pct, b
     } else {
         uint32_t pos_sec = (elapsed_sec + 9U) % 218U;
         knob_offset = (int16_t)(((int32_t)bar_w * (int32_t)pos_sec) / 218);
-        if (knob_offset < 10) knob_offset = 10;
+        if (knob_offset < 6) knob_offset = 6;
     }
 
     int16_t knob_x = bar_x0 + knob_offset;
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, SLIDER_BAR_H, bar_x0, bar_y, knob_offset, 2, COL_LABEL_TERRA);
-    buf_fill_circle(s_bar_buf, TFT_WIDTH, SLIDER_BAR_H, knob_x, bar_y, 4, COL_LABEL_TERRA);
+    buf_fill_rect(s_bar_buf, w, h, bar_x0, bar_y, knob_offset, 2, COL_LABEL_TERRA);
+    buf_fill_circle(s_bar_buf, w, h, knob_x, bar_y, knob_r, COL_LABEL_TERRA);
 
-    /* Thoi gian ben trai ("0:09") */
     uint32_t disp_sec = (elapsed_sec + 9U) % 218U;
     char left_str[12];
     snprintf(left_str, sizeof(left_str), "%u:%02u", (unsigned)(disp_sec / 60U), (unsigned)(disp_sec % 60U));
-    buf_draw_text(s_bar_buf, TFT_WIDTH, SLIDER_BAR_H, left_str, bar_x0, 12, 1, COL_TEXT_MUTED);
+    buf_draw_text(s_bar_buf, w, h, left_str, bar_x0, txt_y, 1, COL_TEXT_MUTED);
 
-    /* Chi so ben phai ("-3:28" hoac "VOL 75%") */
     char right_str[16];
     if (show_vol_label) {
         snprintf(right_str, sizeof(right_str), "VOL %u%%", (unsigned)volume_pct);
@@ -633,103 +795,91 @@ static void render_slider_dirty_rect(uint32_t elapsed_sec, uint8_t volume_pct, b
         snprintf(right_str, sizeof(right_str), "-%u:%02u", (unsigned)(rem_sec / 60U), (unsigned)(rem_sec % 60U));
     }
     int16_t rw = text_pixel_width(right_str, 1);
-    buf_draw_text(s_bar_buf, TFT_WIDTH, SLIDER_BAR_H, right_str, bar_x1 - rw, 12, 1, COL_TEXT_MUTED);
+    buf_draw_text(s_bar_buf, w, h, right_str, bar_x1 - rw, txt_y, 1, COL_TEXT_MUTED);
 
-    lcd_draw_bitmap_dma_sync(0, SLIDER_BAR_Y, TFT_WIDTH, SLIDER_BAR_Y + SLIDER_BAR_H, s_bar_buf);
+    lcd_draw_bitmap_dma_sync(0, s_ui.slider_y, w, s_ui.slider_y + h, s_bar_buf);
 }
 
 /* =========================================================================
- * 5. DIRTY-RECTANGLE: BOTTOM TRANSPORT BAR (Y: 200..239)
- *   - Trai cung (X=30): Icon Shuffle
- *   - Giua trai (X=73): Nut tron xam nhat (#E4E0D7) + Icon Previous (|<)
- *   - Chinh giua (X=120): Nut tron lon Do Terracotta (#C24B38, r=17) + Play/Pause Trang
- *   - Giua phai (X=167): Nut tron xam nhat (#E4E0D7) + Icon Next (>|)
- *   - Phai cung (X=210): Icon Repeat
+ * 5. DIRTY-RECTANGLE: BOTTOM TRANSPORT BAR
  * ========================================================================= */
 static void draw_shuffle_icon(uint16_t *buf, int16_t bw, int16_t bh, int16_t cx, int16_t cy, uint16_t col)
 {
-    buf_fill_rect(buf, bw, bh, cx - 6, cy - 3, 3, 1, col);
-    buf_draw_line(buf, bw, bh, cx - 3, cy - 3, cx + 3, cy + 3, col);
-    buf_fill_rect(buf, bw, bh, cx + 3, cy + 3, 4, 1, col);
-    buf_put_pixel(buf, bw, bh, cx + 5, cy + 2, col);
-    buf_put_pixel(buf, bw, bh, cx + 4, cy + 1, col);
-    buf_put_pixel(buf, bw, bh, cx + 5, cy + 4, col);
-    buf_put_pixel(buf, bw, bh, cx + 4, cy + 5, col);
+    buf_fill_rect(buf, bw, bh, cx - 5, cy - 2, 3, 1, col);
+    buf_draw_line(buf, bw, bh, cx - 2, cy - 2, cx + 2, cy + 2, col);
+    buf_fill_rect(buf, bw, bh, cx + 2, cy + 2, 3, 1, col);
 
-    buf_fill_rect(buf, bw, bh, cx - 6, cy + 3, 3, 1, col);
-    buf_draw_line(buf, bw, bh, cx - 3, cy + 3, cx + 3, cy - 3, col);
-    buf_fill_rect(buf, bw, bh, cx + 3, cy - 3, 4, 1, col);
-    buf_put_pixel(buf, bw, bh, cx + 5, cy - 4, col);
-    buf_put_pixel(buf, bw, bh, cx + 4, cy - 5, col);
-    buf_put_pixel(buf, bw, bh, cx + 5, cy - 2, col);
-    buf_put_pixel(buf, bw, bh, cx + 4, cy - 1, col);
+    buf_fill_rect(buf, bw, bh, cx - 5, cy + 2, 3, 1, col);
+    buf_draw_line(buf, bw, bh, cx - 2, cy + 2, cx + 2, cy - 2, col);
+    buf_fill_rect(buf, bw, bh, cx + 2, cy - 2, 3, 1, col);
 }
 
 static void draw_repeat_icon(uint16_t *buf, int16_t bw, int16_t bh, int16_t cx, int16_t cy, uint16_t col)
 {
-    buf_fill_rect(buf, bw, bh, cx - 5, cy - 4, 10, 1, col);
-    buf_fill_rect(buf, bw, bh, cx - 6, cy - 3, 1, 3, col);
-    buf_put_pixel(buf, bw, bh, cx + 3, cy - 6, col);
-    buf_put_pixel(buf, bw, bh, cx + 4, cy - 5, col);
-    buf_put_pixel(buf, bw, bh, cx + 4, cy - 3, col);
-    buf_put_pixel(buf, bw, bh, cx + 3, cy - 2, col);
-
-    buf_fill_rect(buf, bw, bh, cx - 4, cy + 4, 10, 1, col);
-    buf_fill_rect(buf, bw, bh, cx + 6, cy + 1, 1, 3, col);
-    buf_put_pixel(buf, bw, bh, cx - 3, cy + 2, col);
-    buf_put_pixel(buf, bw, bh, cx - 4, cy + 3, col);
-    buf_put_pixel(buf, bw, bh, cx - 4, cy + 5, col);
-    buf_put_pixel(buf, bw, bh, cx - 3, cy + 6, col);
+    buf_fill_rect(buf, bw, bh, cx - 4, cy - 3, 8, 1, col);
+    buf_fill_rect(buf, bw, bh, cx - 5, cy - 2, 1, 3, col);
+    buf_fill_rect(buf, bw, bh, cx - 3, cy + 3, 8, 1, col);
+    buf_fill_rect(buf, bw, bh, cx + 5, cy,     1, 3, col);
 }
 
 static void render_bottom_dirty_rect(bool is_playing)
 {
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, 0, 0, TFT_WIDTH, BOTTOM_BAR_H, COL_BG_CREAM);
+    const int16_t w  = s_ui.width;
+    const int16_t h  = s_ui.bottom_h;
+    const int16_t cy = h / 2;
+    const bool    compact = (s_ui.mode == LCD_MODE_ST7735_128X160);
 
-    const int16_t cy = 19;
+    buf_fill_rect(s_bar_buf, w, h, 0, 0, w, h, COL_BG_CREAM);
 
-    /* 1. Shuffle Icon ben trai (cx = 30) */
-    draw_shuffle_icon(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, 30, cy, COL_TEXT_DARK);
+    const int16_t shuf_cx = (w * 12) / 100;
+    const int16_t prev_cx = (w * 30) / 100;
+    const int16_t play_cx = w / 2;
+    const int16_t next_cx = (w * 70) / 100;
+    const int16_t rept_cx = (w * 88) / 100;
 
-    /* 2. Nut Previous tron (cx = 73, r = 12) + Icon |< */
-    const int16_t prev_cx = 73;
-    buf_fill_circle(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, prev_cx, cy, 12, COL_BTN_CIRCLE);
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, prev_cx - 4, cy - 4, 1, 9, COL_TEXT_DARK);
-    buf_draw_line(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, prev_cx - 2, cy,     prev_cx + 4, cy - 4, COL_TEXT_DARK);
-    buf_draw_line(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, prev_cx - 2, cy,     prev_cx + 4, cy + 4, COL_TEXT_DARK);
-    buf_draw_line(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, prev_cx + 4, cy - 4, prev_cx + 4, cy + 4, COL_TEXT_DARK);
+    const int16_t side_r  = compact ? 7 : 12;
+    const int16_t play_r  = compact ? 9 : 17;
 
-    /* 3. Nut Play / Pause Tron Lon Terracotta (cx = 120, r = 17) */
-    const int16_t play_cx = 120;
-    buf_fill_circle(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, play_cx, cy, 18, COL_LABEL_RING);
-    buf_fill_circle(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, play_cx, cy, 17, COL_LABEL_TERRA);
+    /* 1. Shuffle Icon */
+    draw_shuffle_icon(s_bar_buf, w, h, shuf_cx, cy, COL_TEXT_DARK);
+
+    /* 2. Nut Previous tron + Icon |< */
+    buf_fill_circle(s_bar_buf, w, h, prev_cx, cy, side_r, COL_BTN_CIRCLE);
+    buf_fill_rect(s_bar_buf, w, h, prev_cx - 3, cy - 3, 1, 7, COL_TEXT_DARK);
+    buf_draw_line(s_bar_buf, w, h, prev_cx - 1, cy,     prev_cx + 3, cy - 3, COL_TEXT_DARK);
+    buf_draw_line(s_bar_buf, w, h, prev_cx - 1, cy,     prev_cx + 3, cy + 3, COL_TEXT_DARK);
+    buf_draw_line(s_bar_buf, w, h, prev_cx + 3, cy - 3, prev_cx + 3, cy + 3, COL_TEXT_DARK);
+
+    /* 3. Nut Play / Pause Tron Lon Terracotta */
+    buf_fill_circle(s_bar_buf, w, h, play_cx, cy, play_r + 1, COL_LABEL_RING);
+    buf_fill_circle(s_bar_buf, w, h, play_cx, cy, play_r,     COL_LABEL_TERRA);
 
     if (!is_playing) {
-        /* Khi PAUSED: Hien thi Tam giac Play (▶) trang can doi tuyet doi de nhan Resume */
-        for (int16_t dx = 0; dx < 9; dx++) {
-            int16_t half_h = (int16_t)((8 - dx) / 2);
-            int16_t h = (int16_t)(half_h * 2 + 1);
-            buf_fill_rect(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H,
-                          play_cx - 3 + dx, cy - half_h, 1, h, COL_PURE_WHITE);
+        int16_t tri_w = compact ? 6 : 9;
+        for (int16_t dx = 0; dx < tri_w; dx++) {
+            int16_t half_h = (int16_t)((tri_w - 1 - dx) / 2);
+            int16_t bar_h  = (int16_t)(half_h * 2 + 1);
+            buf_fill_rect(s_bar_buf, w, h,
+                          play_cx - (tri_w / 3) + dx, cy - half_h, 1, bar_h, COL_PURE_WHITE);
         }
     } else {
-        /* Khi PLAYING: Hien thi 2 thanh Pause (||) trang sac net tren nen tron Terracotta */
-        buf_fill_rect(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, play_cx - 5, cy - 5, 3, 11, COL_PURE_WHITE);
-        buf_fill_rect(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, play_cx + 2, cy - 5, 3, 11, COL_PURE_WHITE);
+        int16_t bh = compact ? 7 : 11;
+        int16_t bw = compact ? 2 : 3;
+        buf_fill_rect(s_bar_buf, w, h, play_cx - bw - 1, cy - (bh / 2), bw, bh, COL_PURE_WHITE);
+        buf_fill_rect(s_bar_buf, w, h, play_cx + 2,      cy - (bh / 2), bw, bh, COL_PURE_WHITE);
     }
 
-    /* 4. Nut Next tron (cx = 167, r = 12) + Icon >| */
-    const int16_t next_cx = 167;
-    buf_fill_circle(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, next_cx, cy, 12, COL_BTN_CIRCLE);
-    buf_draw_line(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, next_cx - 4, cy - 4, next_cx - 4, cy + 4, COL_TEXT_DARK);
-    buf_draw_line(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, next_cx - 4, cy - 4, next_cx + 2, cy,     COL_TEXT_DARK);
-    buf_draw_line(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, next_cx - 4, cy + 4, next_cx + 2, cy,     COL_TEXT_DARK);
-    buf_fill_rect(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, next_cx + 4, cy - 4, 1, 9, COL_TEXT_DARK);
+    /* 4. Nut Next tron + Icon >| */
+    buf_fill_circle(s_bar_buf, w, h, next_cx, cy, side_r, COL_BTN_CIRCLE);
+    buf_draw_line(s_bar_buf, w, h, next_cx - 3, cy - 3, next_cx - 3, cy + 3, COL_TEXT_DARK);
+    buf_draw_line(s_bar_buf, w, h, next_cx - 3, cy - 3, next_cx + 1, cy,     COL_TEXT_DARK);
+    buf_draw_line(s_bar_buf, w, h, next_cx - 3, cy + 3, next_cx + 1, cy,     COL_TEXT_DARK);
+    buf_fill_rect(s_bar_buf, w, h, next_cx + 3, cy - 3, 1, 7, COL_TEXT_DARK);
 
-    /* 5. Repeat Icon ben phai (cx = 210) */
-    draw_repeat_icon(s_bar_buf, TFT_WIDTH, BOTTOM_BAR_H, 210, cy, COL_TEXT_DARK);
+    /* 5. Repeat Icon */
+    draw_repeat_icon(s_bar_buf, w, h, rept_cx, cy, COL_TEXT_DARK);
 
-    lcd_draw_bitmap_dma_sync(0, BOTTOM_BAR_Y, TFT_WIDTH, BOTTOM_BAR_Y + BOTTOM_BAR_H, s_bar_buf);
+    lcd_draw_bitmap_dma_sync(0, s_ui.bottom_y, w, s_ui.bottom_y + h, s_bar_buf);
 }
 
 /* =========================================================================
@@ -742,11 +892,283 @@ void ui_st7789_notify(uint32_t notify_bits)
     }
 }
 
+void ui_st7789_get_resolution(int16_t *out_w, int16_t *out_h)
+{
+    if (out_w != NULL) *out_w = s_ui.width;
+    if (out_h != NULL) *out_h = s_ui.height;
+}
+
+uint16_t *ui_st7789_lock_video_buf(void)
+{
+    atomic_store(&g_radio_state.is_video_mode, true);
+    s_last_video_frame_us = esp_timer_get_time();
+    if (s_lcd_mutex != NULL && xSemaphoreTake(s_lcd_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
+        return s_bar_buf;
+    }
+    return NULL;
+}
+
+void ui_st7789_draw_video_strip(int16_t y_start, int16_t strip_h)
+{
+    lcd_draw_bitmap_dma_sync(0, y_start, s_ui.width, y_start + strip_h, s_bar_buf);
+}
+
+void ui_st7789_wait_video_dma(bool *io_dma_inflight)
+{
+    if (io_dma_inflight != NULL && *io_dma_inflight) {
+        (void)xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(100));
+        *io_dma_inflight = false;
+    }
+}
+
+void ui_st7789_draw_video_strip_async(int16_t y_start, int16_t strip_h, const void *buf, bool *io_dma_inflight)
+{
+    ui_st7789_wait_video_dma(io_dma_inflight);
+    if (esp_lcd_panel_draw_bitmap(s_panel_handle, 0, y_start, s_ui.width, y_start + strip_h, buf) == ESP_OK) {
+        if (io_dma_inflight != NULL) {
+            *io_dma_inflight = true;
+        }
+    }
+}
+
+void ui_st7789_unlock_video_buf(void)
+{
+    if (s_lcd_mutex != NULL) {
+        xSemaphoreGive(s_lcd_mutex);
+    }
+}
+
+/* Triple-Buffer JPEG tinh (3 x 10 KB) giup Core 0 (WiFi/WS) va Core 1 (Decode/DMA) chay song song 100% */
+#define VID_SLOT_COUNT     3
+#define VID_SLOT_MAX_BYTES 10240
+
+static uint8_t __attribute__((aligned(4))) s_vid_slots[VID_SLOT_COUNT][VID_SLOT_MAX_BYTES];
+static size_t       s_vid_len[VID_SLOT_COUNT];
+static int8_t       s_slot_decoding = -1;
+static int8_t       s_slot_latest   = -1;
+static int8_t       s_slot_writing  = -1;
+static portMUX_TYPE s_vid_spinlock  = portMUX_INITIALIZER_UNLOCKED;
+
+void ui_st7789_stop_video_mode(void)
+{
+    portENTER_CRITICAL(&s_vid_spinlock);
+    s_slot_latest = -1;
+    portEXIT_CRITICAL(&s_vid_spinlock);
+    atomic_store(&g_radio_state.is_video_mode, false);
+    ui_st7789_notify(UI_NOTIFY_VIDEO_EXIT);
+}
+
+/* =========================================================================
+ * Giai ma JPEG bang ESP32 ROM (tjpgd.h) + Ping-Pong Async SPI DMA (Zero malloc)
+ *   - s_bar_buf (19.2 KB) chia 2 nua: CPU giai ma strip N+1 vao nua B
+ *     trong khi SPI DMA dang day strip N tu nua A ra man hinh (song song 100%)
+ *   - strip_h = boi so cua 16 (khop MCU 16x16 cua JPEG 4:2:0)
+ * ========================================================================= */
+typedef struct {
+    const uint8_t *data;
+    size_t         len;
+    size_t         pos;
+    int16_t        strip_y0;
+    int16_t        strip_h;
+    int16_t        max_x;
+    int16_t        max_y;
+    uint16_t      *bufs[2];
+    uint8_t        cur;
+    bool           dma_inflight;
+} jpeg_stream_ctx_t;
+
+static uint8_t __attribute__((aligned(4))) s_tjpgd_pool[3584];
+static volatile uint32_t s_last_decode_us = 0;
+
+void ui_st7789_enter_video_mode(void)
+{
+    portENTER_CRITICAL(&s_vid_spinlock);
+    s_last_video_frame_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_vid_spinlock);
+    atomic_store(&g_radio_state.is_video_mode, true);
+    ui_st7789_notify(UI_NOTIFY_VIDEO_FRAME);
+}
+
+uint32_t ui_st7789_last_decode_ms(void)
+{
+    return (uint32_t)(s_last_decode_us / 1000U);
+}
+
+uint8_t *ui_st7789_video_acquire_slot(int8_t *out_slot, size_t max_len)
+{
+    if (out_slot == NULL || max_len > VID_SLOT_MAX_BYTES) {
+        return NULL;
+    }
+    int8_t chosen = -1;
+    portENTER_CRITICAL(&s_vid_spinlock);
+    for (int8_t i = 0; i < VID_SLOT_COUNT; i++) {
+        if (i != s_slot_decoding && i != s_slot_latest) {
+            chosen = i;
+            break;
+        }
+    }
+    if (chosen >= 0) {
+        s_slot_writing = chosen;
+    }
+    portEXIT_CRITICAL(&s_vid_spinlock);
+    if (chosen < 0) {
+        return NULL;
+    }
+    *out_slot = chosen;
+    return s_vid_slots[chosen];
+}
+
+void ui_st7789_video_submit_slot(int8_t slot_idx, size_t len)
+{
+    if (slot_idx < 0 || slot_idx >= VID_SLOT_COUNT) {
+        return;
+    }
+    if (len == 0 || len > VID_SLOT_MAX_BYTES) {
+        portENTER_CRITICAL(&s_vid_spinlock);
+        if (s_slot_writing == slot_idx) {
+            s_slot_writing = -1;
+        }
+        portEXIT_CRITICAL(&s_vid_spinlock);
+        return;
+    }
+    portENTER_CRITICAL(&s_vid_spinlock);
+    s_vid_len[slot_idx] = len;
+    s_slot_latest = slot_idx;
+    if (s_slot_writing == slot_idx) {
+        s_slot_writing = -1;
+    }
+    s_last_video_frame_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_vid_spinlock);
+
+    atomic_store(&g_radio_state.is_video_mode, true);
+    ui_st7789_notify(UI_NOTIFY_VIDEO_FRAME);
+}
+
+static UINT tjpgd_in_func(JDEC *jd, BYTE *buff, UINT ndata)
+{
+    jpeg_stream_ctx_t *ctx = (jpeg_stream_ctx_t *)jd->device;
+    size_t rem = ctx->len - ctx->pos;
+    UINT to_read = (ndata < rem) ? ndata : (UINT)rem;
+    if (buff != NULL && to_read > 0) {
+        memcpy(buff, ctx->data + ctx->pos, to_read);
+    }
+    ctx->pos += to_read;
+    return to_read;
+}
+
+/* Day strip hien tai (nua cur) qua DMA bat dong bo roi doi sang nua con lai */
+static void jpeg_flush_strip(jpeg_stream_ctx_t *ctx)
+{
+    int16_t flush_h = ctx->strip_h;
+    if (ctx->strip_y0 + flush_h > ctx->max_y) {
+        flush_h = ctx->max_y - ctx->strip_y0;
+    }
+    if (flush_h > 0) {
+        /* Ham nay cho DMA cua nua kia xong (neu con dang chay) roi moi phat lenh moi */
+        ui_st7789_draw_video_strip_async(ctx->strip_y0, flush_h, ctx->bufs[ctx->cur], &ctx->dma_inflight);
+        ctx->cur ^= 1U;
+    }
+    ctx->strip_y0 += ctx->strip_h;
+}
+
+static UINT tjpgd_out_func(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    jpeg_stream_ctx_t *ctx = (jpeg_stream_ctx_t *)jd->device;
+    const int16_t top = (int16_t)rect->top;
+
+    if (top >= ctx->max_y) {
+        return 1;
+    }
+    while (top >= ctx->strip_y0 + ctx->strip_h) {
+        jpeg_flush_strip(ctx);
+    }
+
+    const uint8_t *src = (const uint8_t *)bitmap;
+    const int16_t left = (int16_t)rect->left;
+    const int16_t bw   = (int16_t)(rect->right - rect->left + 1);
+    const int16_t bh   = (int16_t)(rect->bottom - rect->top + 1);
+    const int16_t w    = ctx->max_x;
+    int16_t cols = bw;
+    if (left + cols > w) {
+        cols = w - left;
+    }
+    if (cols <= 0) {
+        return 1;
+    }
+
+    uint16_t *strip_buf = ctx->bufs[ctx->cur];
+    for (int16_t row = 0; row < bh; row++) {
+        int16_t gy = top + row;
+        if (gy >= ctx->max_y) break;
+        int16_t ly = gy - ctx->strip_y0;
+        if (ly < 0 || ly >= ctx->strip_h) continue;
+
+        uint16_t *dst = &strip_buf[ly * w + left];
+        const uint8_t *s = src + (row * bw * 3);
+        for (int16_t col = 0; col < cols; col++, s += 3) {
+            uint16_t raw = (uint16_t)(((uint16_t)(s[0] & 0xF8U) << 8) |
+                                      ((uint16_t)(s[1] & 0xFCU) << 3) |
+                                      ((uint16_t)s[2] >> 3));
+            dst[col] = (uint16_t)((raw >> 8) | (raw << 8));
+        }
+    }
+    return 1;
+}
+
+bool ui_st7789_draw_jpeg_frame(const uint8_t *jpg_data, size_t jpg_len)
+{
+    if (jpg_data == NULL || jpg_len < 16) {
+        return false;
+    }
+    atomic_store(&g_radio_state.is_video_mode, true);
+    s_last_video_frame_us = esp_timer_get_time();
+
+    if (s_lcd_mutex == NULL || xSemaphoreTake(s_lcd_mutex, pdMS_TO_TICKS(150)) != pdTRUE) {
+        return false;
+    }
+
+    int64_t t_start = esp_timer_get_time();
+
+    /* Moi nua buffer = 4,800 px. strip_h = boi so 16: 128px -> 32 dong, 160/240px -> 16 dong */
+    const int32_t half_px = (int32_t)(sizeof(s_bar_buf) / sizeof(s_bar_buf[0])) / 2;
+    int16_t strip_h = (int16_t)((half_px / s_ui.width) & ~15);
+    if (strip_h < 16) strip_h = 16;
+
+    jpeg_stream_ctx_t ctx = {
+        .data         = jpg_data,
+        .len          = jpg_len,
+        .pos          = 0,
+        .strip_y0     = 0,
+        .strip_h      = strip_h,
+        .max_x        = s_ui.width,
+        .max_y        = s_ui.height,
+        .bufs         = { s_bar_buf, s_bar_buf + half_px },
+        .cur          = 0,
+        .dma_inflight = false
+    };
+
+    JDEC jdec;
+    JRESULT res = jd_prepare(&jdec, tjpgd_in_func, s_tjpgd_pool, sizeof(s_tjpgd_pool), &ctx);
+    if (res == JDR_OK) {
+        if ((int16_t)jdec.height < ctx.max_y) {
+            ctx.max_y = (int16_t)jdec.height;
+        }
+        res = jd_decomp(&jdec, tjpgd_out_func, 0);
+        if (res == JDR_OK && ctx.strip_y0 < ctx.max_y) {
+            jpeg_flush_strip(&ctx);
+        }
+    }
+
+    /* Bat buoc cho DMA strip cuoi xong truoc khi tra s_bar_buf cho task khac */
+    ui_st7789_wait_video_dma(&ctx.dma_inflight);
+    s_last_decode_us = (uint32_t)(esp_timer_get_time() - t_start);
+
+    xSemaphoreGive(s_lcd_mutex);
+    return (res == JDR_OK);
+}
+
 /* =========================================================================
  * CORE 1 (Priority 4): ui_render_task
- * - Khi PLAYING: cap nhat ~30 FPS (timeout 33ms tren xTaskNotifyWait)
- * - Khi PAUSED:  giam tan suat refresh (timeout 500ms) de tiet kiem CPU,
- *                nhung thuc day TUC THI (< 1ms) khi nhan TaskNotify tu GPIO 0!
  * ========================================================================= */
 static void ui_render_task(void *arg)
 {
@@ -768,38 +1190,106 @@ static void ui_render_task(void *arg)
     int64_t  last_sec_us = esp_timer_get_time();
     int64_t  vol_overlay_until_us = 0;
 
-    /* Ve lan dau toan bo 5 Dirty-Rectangles */
     bool playing = atomic_load(&g_radio_state.is_playing);
     bool wifi_ok = atomic_load(&g_radio_state.wifi_connected);
 
-    render_top_ip_dirty_rect(wifi_ok, local_ip);
-    render_vinyl_dirty_rect(g_radio_state.disc_angle, playing);
-    render_title_dirty_rect(local_station, local_title, 0, &song_px_width);
-    render_slider_dirty_rect(elapsed_sec, g_radio_state.volume, false);
-    render_bottom_dirty_rect(playing);
+    if (xSemaphoreTake(s_lcd_mutex, portMAX_DELAY) == pdTRUE) {
+        render_top_ip_dirty_rect(wifi_ok, local_ip);
+        render_vinyl_dirty_rect(g_radio_state.disc_angle, playing);
+        render_title_dirty_rect(local_station, local_title, 0, &song_px_width);
+        render_slider_dirty_rect(elapsed_sec, g_radio_state.volume, false);
+        render_bottom_dirty_rect(playing);
+        xSemaphoreGive(s_lcd_mutex);
+    }
+
+    int16_t max_vis_w = s_ui.width - ((s_ui.mode == LCD_MODE_ST7735_128X160) ? 12 : 24);
+    bool    was_in_video = false;
 
     for (;;) {
         playing = atomic_load(&g_radio_state.is_playing);
-        bool need_marquee = (song_px_width > (TFT_WIDTH - 24));
+        bool in_video = atomic_load(&g_radio_state.is_video_mode);
+        bool need_marquee = (song_px_width > max_vis_w);
 
-        /* Khi dang phat: ~30 FPS (33ms). Khi Pause: 500ms (hoac 40ms neu dang cuon chu) */
-        TickType_t wait_ticks = playing ? pdMS_TO_TICKS(33)
-                                        : (need_marquee ? pdMS_TO_TICKS(40) : pdMS_TO_TICKS(500));
+        if (in_video != was_in_video) {
+            vTaskPrioritySet(NULL, in_video ? 12 : TASK_PRIO_UI_RENDER);
+            was_in_video = in_video;
+        }
+
+        TickType_t wait_ticks = in_video ? pdMS_TO_TICKS(250)
+                                         : (playing ? pdMS_TO_TICKS(33)
+                                                    : (need_marquee ? pdMS_TO_TICKS(40) : pdMS_TO_TICKS(500)));
 
         uint32_t notify_bits = 0;
         (void)xTaskNotifyWait(0UL, ULONG_MAX, &notify_bits, wait_ticks);
 
-        playing = atomic_load(&g_radio_state.is_playing);
-        wifi_ok = atomic_load(&g_radio_state.wifi_connected);
+        playing  = atomic_load(&g_radio_state.is_playing);
+        wifi_ok  = atomic_load(&g_radio_state.wifi_connected);
+        in_video = atomic_load(&g_radio_state.is_video_mode);
         int64_t now_us = esp_timer_get_time();
 
-        /* 1. Neu thay doi trang thai WiFi / IP -> cap nhat ngay IP o goc trai man hinh */
+        /* Neu dang o Video Mode: giai ma + Ping-Pong DMA tren Core 1 song song voi WiFi tren Core 0 */
+        if (in_video) {
+            if (!was_in_video) {
+                vTaskPrioritySet(NULL, 12);
+                was_in_video = true;
+            }
+            for (;;) {
+                int8_t idx = -1;
+                size_t len = 0;
+                portENTER_CRITICAL(&s_vid_spinlock);
+                if (s_slot_latest >= 0) {
+                    idx = s_slot_latest;
+                    s_slot_latest = -1;
+                    s_slot_decoding = idx;
+                    len = s_vid_len[idx];
+                }
+                portEXIT_CRITICAL(&s_vid_spinlock);
+
+                if (idx < 0) {
+                    break;
+                }
+                (void)ui_st7789_draw_jpeg_frame(s_vid_slots[idx], len);
+                portENTER_CRITICAL(&s_vid_spinlock);
+                s_slot_decoding = -1;
+                portEXIT_CRITICAL(&s_vid_spinlock);
+                now_us = esp_timer_get_time();
+            }
+
+            if ((now_us - s_last_video_frame_us) > 3500000LL) {
+                atomic_store(&g_radio_state.is_video_mode, false);
+                vTaskPrioritySet(NULL, TASK_PRIO_UI_RENDER);
+                was_in_video = false;
+                notify_bits |= UI_NOTIFY_VIDEO_EXIT;
+            } else {
+                continue;
+            }
+        } else if (was_in_video) {
+            vTaskPrioritySet(NULL, TASK_PRIO_UI_RENDER);
+            was_in_video = false;
+        }
+
+        if (xSemaphoreTake(s_lcd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+
+        if ((notify_bits & UI_NOTIFY_VIDEO_EXIT) != 0) {
+            radio_state_get_strings(local_station, sizeof(local_station),
+                                    local_title, sizeof(local_title));
+            radio_state_get_ip(local_ip, sizeof(local_ip));
+            render_top_ip_dirty_rect(wifi_ok, local_ip);
+            render_vinyl_dirty_rect(g_radio_state.disc_angle, playing);
+            render_title_dirty_rect(local_station, local_title, marquee_offset_px, &song_px_width);
+            render_slider_dirty_rect(elapsed_sec, g_radio_state.volume, false);
+            render_bottom_dirty_rect(playing);
+            xSemaphoreGive(s_lcd_mutex);
+            continue;
+        }
+
         if ((notify_bits & UI_NOTIFY_WIFI) != 0) {
             radio_state_get_ip(local_ip, sizeof(local_ip));
             render_top_ip_dirty_rect(wifi_ok, local_ip);
         }
 
-        /* 2. Neu thay doi Station hoac Metadata -> doc lai chuoi an toan */
         if ((notify_bits & (UI_NOTIFY_STATION | UI_NOTIFY_METADATA)) != 0) {
             radio_state_get_strings(local_station, sizeof(local_station),
                                     local_title, sizeof(local_title));
@@ -809,18 +1299,15 @@ static void ui_render_task(void *arg)
             render_title_dirty_rect(local_station, local_title, 0, &song_px_width);
         }
 
-        /* 3. Neu thay doi Play/Pause tu GPIO 0 hoac Web -> cap nhat nut tron duoi cung ngay */
         if ((notify_bits & UI_NOTIFY_PLAY_STATE) != 0) {
             render_bottom_dirty_rect(playing);
         }
 
-        /* 4. Neu thay doi Volume -> hien thi VOL XX% tren thanh tien trinh trong 3 giay */
         if ((notify_bits & UI_NOTIFY_VOLUME) != 0) {
             vol_overlay_until_us = now_us + 3000000LL;
             render_slider_dirty_rect(elapsed_sec, g_radio_state.volume, true);
         }
 
-        /* 5. Cap nhat bo dem giay tren thanh tien trinh khi dang phat */
         if (playing && (now_us - last_sec_us) >= 1000000LL) {
             last_sec_us = now_us;
             elapsed_sec++;
@@ -828,24 +1315,21 @@ static void ui_render_task(void *arg)
             render_slider_dirty_rect(elapsed_sec, g_radio_state.volume, show_vol);
         }
 
-        /* 6. Vung Dia than: CHI cap nhat khi is_playing == true hoac vua nhan Pause */
         if (playing) {
             g_radio_state.disc_angle = (uint16_t)((g_radio_state.disc_angle + 6U) % 360U);
             render_vinyl_dirty_rect(g_radio_state.disc_angle, true);
         } else if ((notify_bits & UI_NOTIFY_PLAY_STATE) != 0) {
-            /* Khi vua chuyen sang PAUSE: ve 1 lan de dung dia ngay tai goc hien tai & nhac can kim */
             render_vinyl_dirty_rect(g_radio_state.disc_angle, false);
         }
 
-        /* 7. Vung Marquee Song Title: Dich chuyen 1 pixel muot ma voi khoang nghi 2s dau cau */
-        if (song_px_width > (TFT_WIDTH - 24)) {
+        if (song_px_width > max_vis_w) {
             if (marquee_in_pause) {
                 if ((now_us - marquee_pause_since_us) >= 2000000LL) {
                     marquee_in_pause = false;
                 }
             } else {
                 marquee_offset_px += 1;
-                if (marquee_offset_px >= (song_px_width + 48)) {
+                if (marquee_offset_px >= (song_px_width + 36)) {
                     marquee_offset_px = 0;
                     marquee_in_pause = true;
                     marquee_pause_since_us = now_us;
@@ -853,22 +1337,33 @@ static void ui_render_task(void *arg)
                 render_title_dirty_rect(local_station, local_title, marquee_offset_px, &song_px_width);
             }
         }
+
+        xSemaphoreGive(s_lcd_mutex);
     }
 }
 
 /* =========================================================================
- * Khoi tao ST7789 240x240 qua driver goc esp_lcd (SPI DMA, Dirty-Rectangle)
+ * Khoi tao Panel ST7735 (128x160 @ 16MHz, CS=15, Offset 0,0)
+ * hoac ST7789 (240x240 @ 27MHz, CS=5/None, IPS INVON) theo g_radio_state.lcd_mode
  * ========================================================================= */
 esp_err_t ui_st7789_init(void)
 {
-    s_dma_sem = xSemaphoreCreateBinaryStatic(&s_dma_sem_storage);
-    configASSERT(s_dma_sem != NULL);
+    uint8_t mode = g_radio_state.lcd_mode;
+    configure_ui_layout(mode);
 
-    /* 1. Cau hinh chan Backlight (GPIO 32), Reset (GPIO 4) & CS phu tro (GPIO 15) */
+    s_dma_sem   = xSemaphoreCreateBinaryStatic(&s_dma_sem_storage);
+    s_lcd_mutex = xSemaphoreCreateMutexStatic(&s_lcd_mutex_storage);
+    configASSERT(s_dma_sem != NULL && s_lcd_mutex != NULL);
+
+    /* 1. Cau hinh chan Backlight (GPIO 32), Reset (GPIO 4) va chan CS phu */
+    gpio_num_t spi_cs_pin   = (mode == LCD_MODE_ST7735_128X160) ? PIN_NUM_CS    : PIN_TFT_CS_HW;
+    gpio_num_t extra_cs_pin = (mode == LCD_MODE_ST7735_128X160) ? PIN_TFT_CS_HW : PIN_NUM_CS;
+    uint32_t   spi_clk_hz   = (mode == LCD_MODE_ST7735_128X160) ? LCD_PIXEL_CLOCK_HZ : TFT_SPI_CLOCK_HZ;
+
     const gpio_config_t io_cfg = {
-        .pin_bit_mask = (1ULL << PIN_TFT_BLK) |
-                        (1ULL << PIN_TFT_RES) |
-                        (1ULL << PIN_TFT_CS_COMPAT_2),
+        .pin_bit_mask = (1ULL << PIN_NUM_BK_LIGHT) |
+                        (1ULL << PIN_NUM_RST) |
+                        (1ULL << extra_cs_pin),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -878,30 +1373,30 @@ esp_err_t ui_st7789_init(void)
     if (err != ESP_OK) {
         return err;
     }
-    gpio_set_level(PIN_TFT_BLK, 0);
-    gpio_set_level(PIN_TFT_RES, 1);
-    gpio_set_level(PIN_TFT_CS_COMPAT_2, 0);
+    gpio_set_level(PIN_NUM_BK_LIGHT, 0);
+    gpio_set_level(PIN_NUM_RST, 1);
+    gpio_set_level(extra_cs_pin, 0);
 
-    /* 2. Khoi tao bus SPI2 (SCL=18, SDA=23, Max transfer = 240*40*2 bytes) */
+    /* 2. Khoi tao bus SPI2 (LCD_HOST: CLK=18, MOSI=23) */
     const spi_bus_config_t buscfg = {
-        .mosi_io_num     = PIN_TFT_SDA,
+        .mosi_io_num     = PIN_NUM_MOSI,
         .miso_io_num     = -1,
-        .sclk_io_num     = PIN_TFT_SCL,
+        .sclk_io_num     = PIN_NUM_CLK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = TFT_WIDTH * BOTTOM_BAR_H * sizeof(uint16_t),
+        .max_transfer_sz = sizeof(s_bar_buf),
     };
-    err = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    err = spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK) {
-        printf("[UI_ST7789] ERROR: spi_bus_initialize failed: %s\n", esp_err_to_name(err));
+        printf("[UI_LCD] ERROR: spi_bus_initialize failed: %s\n", esp_err_to_name(err));
         return err;
     }
 
-    /* 3. Gan Panel IO SPI (CS=GPIO5 tuong thich ca CS=5 va CS-less, DC=2, 27MHz DMA) */
+    /* 3. Gan Panel IO SPI (ST7735: CS=15 @ 20MHz | ST7789: CS=5 @ 27MHz) */
     const esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num         = PIN_TFT_DC,
-        .cs_gpio_num         = PIN_TFT_CS_HW,
-        .pclk_hz             = TFT_SPI_CLOCK_HZ,
+        .dc_gpio_num         = PIN_NUM_DC,
+        .cs_gpio_num         = spi_cs_pin,
+        .pclk_hz             = spi_clk_hz,
         .lcd_cmd_bits        = 8,
         .lcd_param_bits      = 8,
         .spi_mode            = 0,
@@ -909,13 +1404,13 @@ esp_err_t ui_st7789_init(void)
         .on_color_trans_done = on_lcd_color_trans_done,
         .user_ctx            = NULL,
     };
-    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &s_io_handle);
+    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &s_io_handle);
     if (err != ESP_OK) {
-        printf("[UI_ST7789] ERROR: esp_lcd_new_panel_io_spi failed: %s\n", esp_err_to_name(err));
+        printf("[UI_LCD] ERROR: esp_lcd_new_panel_io_spi failed: %s\n", esp_err_to_name(err));
         return err;
     }
 
-    /* 4. Khoi tao Panel ST7789 (de reset_gpio_num = -1 de chu dong timing reset chuan) */
+    /* 4. Tao esp_lcd panel handle (MIPI-DCS CASET 0x2A / RASET 0x2B / RAMWR 0x2C) */
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = -1,
         .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
@@ -923,47 +1418,103 @@ esp_err_t ui_st7789_init(void)
     };
     err = esp_lcd_new_panel_st7789(s_io_handle, &panel_config, &s_panel_handle);
     if (err != ESP_OK) {
-        printf("[UI_ST7789] ERROR: esp_lcd_new_panel_st7789 failed: %s\n", esp_err_to_name(err));
+        printf("[UI_LCD] ERROR: esp_lcd_new_panel failed: %s\n", esp_err_to_name(err));
         return err;
     }
 
-    /* Goi esp_lcd_panel_init truoc de khoi tao st7789->fb_bits_per_pixel = 16 */
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel_handle));
 
-    /* Thuc thi chuoi Hardware Reset + Init da kiem chung tren phan cung ST7789 cua ban:
-     *   RST LOW 50ms -> HIGH 120ms -> 0x01 (150ms) -> 0x11 (120ms)
-     *   -> 0x36 (0x70) -> 0x3A (0x55) -> 0x21 (INVON) -> 0x29 (50ms)
-     */
-    gpio_set_level(PIN_TFT_RES, 0);
+    /* Hardware Reset chung */
+    gpio_set_level(PIN_NUM_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(PIN_TFT_RES, 1);
+    gpio_set_level(PIN_NUM_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(120));
 
     esp_lcd_panel_io_tx_param(s_io_handle, 0x01, NULL, 0); /* SWRESET */
     vTaskDelay(pdMS_TO_TICKS(150));
 
     esp_lcd_panel_io_tx_param(s_io_handle, 0x11, NULL, 0); /* SLPOUT */
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(150));
 
-    const uint8_t madctl_val = 0x70;
-    esp_lcd_panel_io_tx_param(s_io_handle, 0x36, &madctl_val, 1); /* MADCTL = 0x70 */
+    if (mode == LCD_MODE_ST7735_128X160) {
+        /* ================= KHOI TAO CHONG NHIEU HAT CHO MAN HINH ST7735 (128x160) =================
+         * - INVCTR (0xB4 = 0x07): Line Inversion thay vi Dot Inversion (khu nhieu hat caro)
+         * - PWCTR / VMCTR / Gamma: On dinh dien ap VCOM & tang do tuong phan sac net
+         */
+        const uint8_t frmctr1[] = { 0x01, 0x2C, 0x2D };
+        const uint8_t frmctr2[] = { 0x01, 0x2C, 0x2D };
+        const uint8_t frmctr3[] = { 0x01, 0x2C, 0x2D, 0x01, 0x2C, 0x2D };
+        const uint8_t invctr[]  = { 0x07 };
+        const uint8_t pwctr1[]  = { 0xA2, 0x02, 0x84 };
+        const uint8_t pwctr2[]  = { 0xC5 };
+        const uint8_t pwctr3[]  = { 0x0A, 0x00 };
+        const uint8_t pwctr4[]  = { 0x8A, 0x2A };
+        const uint8_t pwctr5[]  = { 0x8A, 0xEE };
+        const uint8_t vmctr1[]  = { 0x0E };
+        const uint8_t gmctrp1[] = { 0x02, 0x1C, 0x07, 0x12, 0x37, 0x32, 0x29, 0x2D,
+                                    0x29, 0x25, 0x2B, 0x39, 0x00, 0x01, 0x03, 0x10 };
+        const uint8_t gmctrn1[] = { 0x03, 0x1D, 0x07, 0x06, 0x2E, 0x2C, 0x29, 0x2D,
+                                    0x2E, 0x2E, 0x37, 0x3F, 0x00, 0x00, 0x02, 0x10 };
 
-    const uint8_t colmod_val = 0x55;
-    esp_lcd_panel_io_tx_param(s_io_handle, 0x3A, &colmod_val, 1); /* COLMOD = 16-bit */
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xB1, frmctr1, sizeof(frmctr1));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xB2, frmctr2, sizeof(frmctr2));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xB3, frmctr3, sizeof(frmctr3));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xB4, invctr,  sizeof(invctr));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xC0, pwctr1,  sizeof(pwctr1));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xC1, pwctr2,  sizeof(pwctr2));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xC2, pwctr3,  sizeof(pwctr3));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xC3, pwctr4,  sizeof(pwctr4));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xC4, pwctr5,  sizeof(pwctr5));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xC5, vmctr1,  sizeof(vmctr1));
 
-    /* BAT BUOC cho tam nen IPS ST7789: 0x21 (INVON) de 0x0000 hien thi DEN TUYEN & #F4F1EA hien thi KEM SANG */
-    esp_lcd_panel_io_tx_param(s_io_handle, 0x21, NULL, 0); /* INVON */
-    vTaskDelay(pdMS_TO_TICKS(10));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x20, NULL, 0); /* INVOFF (ST7735 Normal Color) */
 
-    esp_lcd_panel_io_tx_param(s_io_handle, 0x29, NULL, 0); /* DISPON */
-    vTaskDelay(pdMS_TO_TICKS(50));
+        const uint8_t madctl_st7735 = (LCD_H_RES <= LCD_V_RES) ? ST7735_MADCTL_PORTRAIT
+                                                               : ST7735_MADCTL_LANDSCAPE;
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x36, &madctl_st7735, 1);
 
-    /* To toan bo nen Kem Giay Am (#F4F1EA) theo tung bang 240x40 dong bo DMA va bat BLK=32 */
-    for (int y = 0; y < TFT_HEIGHT; y += 40) {
-        buf_fill_rect(s_bar_buf, TFT_WIDTH, 40, 0, 0, TFT_WIDTH, 40, COL_BG_CREAM);
-        lcd_draw_bitmap_dma_sync(0, y, TFT_WIDTH, y + 40, s_bar_buf);
+        const uint8_t colmod_st7735 = 0x05; /* 16-bit RGB565 */
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x3A, &colmod_st7735, 1);
+
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xE0, gmctrp1, sizeof(gmctrp1));
+        esp_lcd_panel_io_tx_param(s_io_handle, 0xE1, gmctrn1, sizeof(gmctrn1));
+
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x13, NULL, 0); /* NORON */
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x29, NULL, 0); /* DISPON */
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        /* Ap dung Offset bu vien (mac dinh 0, 0 de CASET 0..127 khong tran cot 127 gay xeo hinh) */
+        int gap_x = (LCD_H_RES <= LCD_V_RES) ? LCD_OFFSET_X : LCD_OFFSET_Y;
+        int gap_y = (LCD_H_RES <= LCD_V_RES) ? LCD_OFFSET_Y : LCD_OFFSET_X;
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel_handle, gap_x, gap_y));
+    } else {
+        /* ================= KHOI TAO RIENG CHO MAN HINH ST7789 (240x240) ================= */
+        const uint8_t madctl_st7789 = 0x70;
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x36, &madctl_st7789, 1);
+
+        const uint8_t colmod_st7789 = 0x55;
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x3A, &colmod_st7789, 1);
+
+        /* IPS ST7789 can INVON (0x21) de 0x0000 hien thi DEN TUYEN */
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x21, NULL, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        esp_lcd_panel_io_tx_param(s_io_handle, 0x29, NULL, 0);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel_handle, 0, 0));
     }
-    gpio_set_level(PIN_TFT_BLK, 1);
+
+    /* To toan bo nen Kem Giay Am (#F4F1EA) va bat den nen BLK=32 */
+    int16_t step_h = 20;
+    for (int16_t y = 0; y < s_ui.height; y += step_h) {
+        int16_t cur_h = (y + step_h <= s_ui.height) ? step_h : (s_ui.height - y);
+        buf_fill_rect(s_bar_buf, s_ui.width, cur_h, 0, 0, s_ui.width, cur_h, COL_BG_CREAM);
+        lcd_draw_bitmap_dma_sync(0, y, s_ui.width, y + cur_h, s_bar_buf);
+    }
+    gpio_set_level(PIN_NUM_BK_LIGHT, 1);
 
     /* 5. Tao ui_render_task tren Core 1 (Priority 4) */
     BaseType_t ok = xTaskCreatePinnedToCore(
@@ -979,6 +1530,11 @@ esp_err_t ui_st7789_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    printf("[UI_ST7789] ST7789 240x240 Vinyl Player UI initialized via esp_lcd (DMA sync active)\n");
+    printf("[UI_LCD] Mode %u (%s %dx%d @ %luMHz, CS=GPIO%d) initialized via esp_lcd DMA\n",
+           (unsigned)mode,
+           (mode == LCD_MODE_ST7735_128X160) ? "ST7735" : "ST7789",
+           (int)s_ui.width, (int)s_ui.height,
+           (unsigned long)(spi_clk_hz / 1000000UL),
+           (int)spi_cs_pin);
     return ESP_OK;
 }

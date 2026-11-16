@@ -169,6 +169,12 @@ static void http_stream_task(void *arg)
             continue;
         }
 
+        /* Neu dang phat Video MP4 tu Web UI -> tam ngung tai stream radio de danh 100% bang thong WiFi */
+        if (atomic_load(&g_radio_state.is_video_mode)) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+            continue;
+        }
+
         xEventGroupClearBits(g_radio_event_group,
                              EVT_STREAM_ABORT_REQ | EVT_STATION_CHANGED | EVT_PREBUFFER_READY);
 
@@ -220,7 +226,7 @@ static void http_stream_task(void *arg)
         /* 2. Vong lap doc du lieu Audio & tach ICY Metadata */
         while (atomic_load(&g_radio_state.wifi_connected)) {
             EventBits_t bits = xEventGroupGetBits(g_radio_event_group);
-            if ((bits & EVT_STATION_CHANGED) != 0) {
+            if ((bits & EVT_STATION_CHANGED) != 0 || atomic_load(&g_radio_state.is_video_mode)) {
                 break;
             }
 
@@ -410,6 +416,12 @@ static void audio_i2s_task(void *arg)
 
         /* 2. Vong lap doc StreamBuffer va ghi ra I2S DMA */
         while (atomic_load(&g_radio_state.is_playing)) {
+            if (atomic_load(&g_radio_state.is_video_mode)) {
+                audio_hw_set_unmute(false);
+                vTaskDelay(pdMS_TO_TICKS(150));
+                continue;
+            }
+            audio_hw_set_unmute(true);
             /* Neu co lenh doi kenh -> xa sach du lieu cu trong StreamBuffer ngay tu consumer */
             EventBits_t bits = xEventGroupGetBits(g_radio_event_group);
             if ((bits & EVT_STATION_CHANGED) != 0) {

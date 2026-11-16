@@ -21,20 +21,55 @@ extern "C" {
 #endif
 
 /* =========================================================================
- * 1. SO DO CHAN PHAN CUNG CO DINH (FIXED HARDWARE PINOUT)
+ * 1. CHON MODE MAN HINH LED / TFT & SO DO CHAN PHAN CUNG
+ *    - LCD_MODE_ST7789_240X240 (0): Man hinh 1.54" ST7789 (240x240, 27MHz, CS=5/None)
+ *    - LCD_MODE_ST7735_128X160 (1): Man hinh 1.8"  ST7735 (128x160, 20MHz, CS=15, Offset 2,1)
+ *    Co the chon mac dinh tai day (RADIO_LCD_MODE) hoac doi truc tiep tren Web UI!
  * ========================================================================= */
-/* Man hinh TFT 1.54" ST7789 (240x240, SPI2_HOST, esp_lcd DMA) */
-#define PIN_TFT_SCL             GPIO_NUM_18
-#define PIN_TFT_SDA             GPIO_NUM_23
-#define PIN_TFT_RES             GPIO_NUM_4
-#define PIN_TFT_DC              GPIO_NUM_2
-#define PIN_TFT_BLK             GPIO_NUM_32
-#define PIN_TFT_CS_HW           GPIO_NUM_5      /* Tuong thich ca man CS=GPIO5 lan man CS-less */
-#define PIN_TFT_CS_COMPAT_2     GPIO_NUM_15     /* Keo LOW phu tro neu module co CS noi GPIO 15 */
+#define LCD_MODE_ST7789_240X240 0
+#define LCD_MODE_ST7735_128X160 1
 
+#ifndef RADIO_LCD_MODE
+#define RADIO_LCD_MODE          LCD_MODE_ST7735_128X160
+#endif
+
+// ================= KHAI BÁO CHÂN MÀN HÌNH ST7735 (128x160) =================
+#define LCD_HOST                SPI2_HOST           // VSPI trên ESP32
+#define LCD_PIXEL_CLOCK_HZ      (20 * 1000 * 1000)  // 20MHz (ổn định nhất, không nhiễu hạt trên ST7735)
+
+#define PIN_NUM_MOSI            GPIO_NUM_23         // Chân SDA trên mạch TFT
+#define PIN_NUM_CLK             GPIO_NUM_18         // Chân SCK trên mạch TFT
+#define PIN_NUM_CS              GPIO_NUM_15         // Chân CS trên mạch TFT
+#define PIN_NUM_DC              GPIO_NUM_2          // Chân A0 trên mạch TFT
+#define PIN_NUM_RST             GPIO_NUM_4          // Chân RESET trên mạch TFT
+#define PIN_NUM_BK_LIGHT        GPIO_NUM_32         // Chân LED trên mạch TFT
+
+// Độ phân giải (Nếu xoay ngang màn hình thành 160x128 thì đảo ngược 2 giá trị này)
+#define LCD_H_RES               128
+#define LCD_V_RES               160
+
+// Offset bù viền: Đặt (0, 0) để CASET (0..127) không vượt quá cột 127 gây xéo hình trên ST7735R
+#define LCD_OFFSET_X            0
+#define LCD_OFFSET_Y            0
+
+/* Huong xoay MADCTL cho ST7735 (Portrait: 0x00 hoac 0xC0 | Landscape: 0x60 hoac 0xA0) */
+#define ST7735_MADCTL_PORTRAIT  0x00
+#define ST7735_MADCTL_LANDSCAPE 0x60
+
+// ================= KHAI BÁO CHÂN MÀN HÌNH ST7789 (240x240) =================
+#define PIN_TFT_SCL             PIN_NUM_CLK
+#define PIN_TFT_SDA             PIN_NUM_MOSI
+#define PIN_TFT_RES             PIN_NUM_RST
+#define PIN_TFT_DC              PIN_NUM_DC
+#define PIN_TFT_BLK             PIN_NUM_BK_LIGHT
+#define PIN_TFT_CS_HW           GPIO_NUM_5          /* CS cho ST7789 (hoac man CS-less) */
+#define PIN_TFT_CS_COMPAT_2     PIN_NUM_CS          /* CS = GPIO 15 cho ST7735 */
+
+#define TFT_MAX_WIDTH           240
+#define TFT_MAX_HEIGHT          240
 #define TFT_WIDTH               240
 #define TFT_HEIGHT              240
-#define TFT_SPI_CLOCK_HZ        (27 * 1000 * 1000) /* 27 MHz SPI DMA (on dinh tuyet doi tren day cam) */
+#define TFT_SPI_CLOCK_HZ        (27 * 1000 * 1000)  /* 27 MHz SPI DMA cho ST7789 */
 
 /* IC Khuech dai & DAC I2S MAX98357A */
 #define PIN_I2S_DIN             GPIO_NUM_25
@@ -61,7 +96,7 @@ extern "C" {
 #define TASK_PRIO_AUDIO_I2S     16              /* Cao nhat: dam bao I2S DMA khong underrun */
 
 /* Kich thuoc Stack cua tung Task (Bytes) */
-#define STACK_SIZE_UI_RENDER    4096
+#define STACK_SIZE_UI_RENDER    5120
 #define STACK_SIZE_WIFI_WEB     5120
 #define STACK_SIZE_HTTP_STREAM  6144
 #define STACK_SIZE_BTN_CTRL     3072
@@ -94,6 +129,8 @@ extern "C" {
 #define UI_NOTIFY_VOLUME            (1UL << 3)
 #define UI_NOTIFY_WIFI              (1UL << 4)
 #define UI_NOTIFY_BUFFERING         (1UL << 5)
+#define UI_NOTIFY_VIDEO_EXIT        (1UL << 6)
+#define UI_NOTIFY_VIDEO_FRAME       (1UL << 7)
 
 /* =========================================================================
  * 4. STRUCT TRANG THAI HE THONG TOI UU RAM (STATIC ALLOCATION)
@@ -109,10 +146,12 @@ typedef struct {
     atomic_bool         is_playing;         /* true = PLAY, false = PAUSE */
     atomic_bool         is_buffering;       /* true = Dang nap Pre-buffer >= 50% */
     atomic_bool         wifi_connected;     /* true = STA da co IP */
+    atomic_bool         is_video_mode;      /* true = Dang stream video MP4 tu Web UI */
 
     /* Bien so nguyen kich thuoc nho nhat */
     uint8_t             volume;             /* 0..100 (%) */
     uint8_t             station_index;      /* Chi so kenh radio hien tai */
+    uint8_t             lcd_mode;           /* 0 = ST7789 (240x240), 1 = ST7735 (128x160) */
     int8_t              wifi_rssi;          /* Cuong do song WiFi (dBm) */
     uint16_t            disc_angle;         /* Goc xoay dia than 0..359 do */
 
